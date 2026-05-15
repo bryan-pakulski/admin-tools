@@ -1,0 +1,9 @@
+pub mod footer;
+pub mod help;
+pub mod sparkline;
+pub mod state_strip;
+pub mod stats;
+pub mod stats_table;
+pub mod thread_info;
+pub mod timeline;
+pub mod transitions_table;
