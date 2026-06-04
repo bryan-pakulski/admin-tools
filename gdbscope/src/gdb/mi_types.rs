@@ -175,3 +175,158 @@ impl MiBody for [(String, MiValue)] {
         MiBody::get(self, key)?.as_const()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn as_const_returns_some_for_const() {
+        let val = MiValue::Const("hello".into());
+        assert_eq!(val.as_const(), Some("hello"));
+    }
+
+    #[test]
+    fn as_const_returns_none_for_tuple() {
+        let val = MiValue::Tuple(vec![]);
+        assert!(val.as_const().is_none());
+    }
+
+    #[test]
+    fn as_const_returns_none_for_list() {
+        let val = MiValue::List(MiList::Empty);
+        assert!(val.as_const().is_none());
+    }
+
+    #[test]
+    fn as_tuple_returns_some_for_tuple() {
+        let pairs = vec![
+            ("key".to_string(), MiValue::Const("val".into())),
+        ];
+        let val = MiValue::Tuple(pairs.clone());
+        assert_eq!(val.as_tuple(), Some(pairs.as_slice()));
+    }
+
+    #[test]
+    fn as_tuple_returns_none_for_const() {
+        let val = MiValue::Const("test".into());
+        assert!(val.as_tuple().is_none());
+    }
+
+    #[test]
+    fn get_and_get_str_on_tuple() {
+        let val = MiValue::Tuple(vec![
+            ("name".to_string(), MiValue::Const("main".into())),
+            ("line".to_string(), MiValue::Const("42".into())),
+            ("file".to_string(), MiValue::Const("test.c".into())),
+        ]);
+        // get returns the right MiValue
+        assert_eq!(
+            val.get("name"),
+            Some(&MiValue::Const("main".into()))
+        );
+        assert_eq!(
+            val.get("line"),
+            Some(&MiValue::Const("42".into()))
+        );
+        // get_str returns the inner string
+        assert_eq!(val.get_str("file"), Some("test.c"));
+        assert_eq!(val.get_str("name"), Some("main"));
+    }
+
+    #[test]
+    fn get_returns_none_for_missing_key() {
+        let val = MiValue::Tuple(vec![
+            ("a".to_string(), MiValue::Const("1".into())),
+        ]);
+        assert!(val.get("nonexistent").is_none());
+        assert!(val.get_str("nonexistent").is_none());
+    }
+
+    #[test]
+    fn get_returns_none_on_non_tuple() {
+        let val = MiValue::Const("hello".into());
+        assert!(val.get("anything").is_none());
+        assert!(val.get_str("anything").is_none());
+    }
+
+    #[test]
+    fn mi_body_get_and_get_str() {
+        let body: Vec<(String, MiValue)> = vec![
+            ("reason".to_string(), MiValue::Const("breakpoint-hit".into())),
+            ("bkptno".to_string(), MiValue::Const("1".into())),
+            ("frame".to_string(), MiValue::Tuple(vec![
+                ("func".to_string(), MiValue::Const("main".into())),
+            ])),
+        ];
+        let slice: &[(String, MiValue)] = &body;
+
+        // get returns MiValue reference
+        assert_eq!(
+            MiBody::get(slice, "reason"),
+            Some(&MiValue::Const("breakpoint-hit".into()))
+        );
+        // get_str returns inner string for Const
+        assert_eq!(MiBody::get_str(slice, "bkptno"), Some("1"));
+        // get_str returns None when value is not a Const
+        assert!(MiBody::get_str(slice, "frame").is_none());
+        // missing key
+        assert!(MiBody::get(slice, "missing").is_none());
+        assert!(MiBody::get_str(slice, "missing").is_none());
+    }
+
+    #[test]
+    fn as_list_values_for_values_variant() {
+        let items = vec![
+            MiValue::Const("a".into()),
+            MiValue::Const("b".into()),
+        ];
+        let val = MiValue::List(MiList::Values(items.clone()));
+        let result = val.as_list_values().unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], MiValue::Const("a".into()));
+        assert_eq!(result[1], MiValue::Const("b".into()));
+    }
+
+    #[test]
+    fn as_list_values_for_empty_list() {
+        let val = MiValue::List(MiList::Empty);
+        let result = val.as_list_values().unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn as_list_values_returns_none_for_results_list() {
+        let val = MiValue::List(MiList::Results(vec![
+            ("k".to_string(), MiValue::Const("v".into())),
+        ]));
+        assert!(val.as_list_values().is_none());
+    }
+
+    #[test]
+    fn as_list_values_returns_none_for_const() {
+        let val = MiValue::Const("nope".into());
+        assert!(val.as_list_values().is_none());
+    }
+
+    #[test]
+    fn display_const() {
+        let val = MiValue::Const("hello".into());
+        assert_eq!(format!("{}", val), "\"hello\"");
+    }
+
+    #[test]
+    fn display_tuple() {
+        let val = MiValue::Tuple(vec![
+            ("a".to_string(), MiValue::Const("1".into())),
+            ("b".to_string(), MiValue::Const("2".into())),
+        ]);
+        assert_eq!(format!("{}", val), "{a=\"1\",b=\"2\"}");
+    }
+
+    #[test]
+    fn display_list_empty() {
+        let val = MiValue::List(MiList::Empty);
+        assert_eq!(format!("{}", val), "[]");
+    }
+}

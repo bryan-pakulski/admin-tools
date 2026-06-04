@@ -27,7 +27,7 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
     f.render_widget(block, rect);
 
     if snap.stack.is_empty() {
-        let msg = Paragraph::new("No stack frames")
+        let msg = Paragraph::new("No stack frames. Press F5 to run or attach to a process.")
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(msg, inner);
         return;

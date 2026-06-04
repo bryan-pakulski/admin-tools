@@ -1,5 +1,5 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -24,7 +24,7 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
     f.render_widget(block, rect);
 
     if snap.registers.is_empty() {
-        let msg = Paragraph::new("No register data")
+        let msg = Paragraph::new("No register data. Toggle panel [6] while stopped.")
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(msg, inner);
         return;
@@ -41,22 +41,37 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
         .unwrap_or(0)
         .min(12);
 
+    let selected = view.registers_scroll;
+
     let lines: Vec<Line> = snap
         .registers
         .iter()
+        .enumerate()
         .skip(scroll)
         .take(visible_height)
-        .map(|reg| {
-            Line::from(vec![
-                Span::styled(
-                    format!("{:<width$} ", reg.name, width = max_name),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(
-                    reg.value.clone(),
-                    Style::default().fg(Color::White),
-                ),
-            ])
+        .map(|(idx, reg)| {
+            let is_selected = idx == selected && focused;
+            if is_selected {
+                let style = Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD);
+                Line::from(Span::styled(
+                    format!("{:<width$} {}", reg.name, reg.value, width = max_name),
+                    style,
+                ))
+            } else {
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:<width$} ", reg.name, width = max_name),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        reg.value.clone(),
+                        Style::default().fg(Color::White),
+                    ),
+                ])
+            }
         })
         .collect();
 

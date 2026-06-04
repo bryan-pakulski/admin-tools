@@ -24,7 +24,7 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
     f.render_widget(block, rect);
 
     if snap.threads.is_empty() {
-        let msg = Paragraph::new("No threads")
+        let msg = Paragraph::new("No threads. Press F5 to start the program.")
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(msg, inner);
         return;

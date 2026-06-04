@@ -18,6 +18,7 @@ use crate::config::{Config, TargetMode};
 use crate::gdb::mi_command::MiCommandBuilder;
 use crate::gdb::mi_parser;
 use crate::gdb::mi_types::{MiBody, MiList, MiRecord, MiValue};
+use crate::tui::SharedRecording;
 use crate::gdb::process::GdbProcess;
 use crate::state::*;
 
@@ -30,6 +31,8 @@ use crate::state::*;
 pub enum GdbCommand {
     Run(Vec<String>),
     Continue,
+    TraceContinue,
+    TraceContinueFull,
     StepOver,
     StepInto,
     StepOut,
@@ -37,8 +40,12 @@ pub enum GdbCommand {
     SelectThread(i32),
     SelectFrame(u32),
     SetBreakpoint(String),
+    SetBreakpointCond { location: String, condition: String },
+    BreakCondition { number: u32, condition: String },
+    SetWatchpoint { expr: String, kind: crate::gdb::mi_command::WatchKind },
     DeleteBreakpoint(u32),
     ToggleBreakpoint(u32),
+    SetRegister { name: String, value: String },
     RefreshRegisters,
     ReadMemory { addr: u64, count: usize },
     ReadMemoryExpr { expr: String, count: usize },
@@ -47,6 +54,18 @@ pub enum GdbCommand {
     EvaluateExpression(String),
     AddWatch(String),
     RemoveWatch(u32),
+    SearchMemoryString { start: u64, length: u64, pattern: String },
+    SearchMemoryBytes { start: u64, length: u64, bytes: Vec<u8> },
+    PatchBytes { addr: u64, bytes: Vec<u8> },
+    /// Analyze cross-references at a given address using the current disassembly.
+    AnalyzeXrefs { addr: u64 },
+    /// Cast memory at an address as a typed value (e.g. "struct sockaddr_in").
+    TypeOverlay { addr: u64, type_expr: String },
+    /// List known functions (optional regex filter).
+    ListFunctions(Option<String>),
+    /// Resolve an address to the nearest symbol.
+    ResolveSymbol(u64),
+    RefreshLibraries,
     RawCommand(String),
     Quit,
 }
@@ -63,14 +82,19 @@ enum PendingKind {
     StackListFrames,
     StackListLocals,
     StackSelectFrame(u32),
+    StackInfoFrame,
+    StackListLocalsSimple,
     ThreadSelect(i32),
     BreakInsert,
     BreakDelete(u32),
     BreakEnable(u32),
     BreakDisable(u32),
+    BreakCondition(u32),
+    BreakWatch,
     BreakList,
     RegisterNames,
     RegisterValues,
+    SetRegister,
     ReadMemory,
     ReadMemoryExpr { count: usize },
     WriteMemory { addr: u64, count: usize },
@@ -87,6 +111,11 @@ enum PendingKind {
     ExecFinish,
     ExecInterrupt,
     CliCommand,
+    SearchMemory,
+    PatchBytes { addr: u64, byte_count: usize },
+    TypeOverlay { addr: u64, type_expr: String },
+    ListFunctions,
+    ResolveSymbol,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +136,7 @@ struct WatchEntry {
 /// via [`SharedState`].
 pub struct GdbController {
     state: SharedState,
+    recording: SharedRecording,
     cmd_rx: mpsc::Receiver<GdbCommand>,
     child: Child,
     stdin: ChildStdin,
@@ -119,6 +149,12 @@ pub struct GdbController {
     watch_expressions: Vec<WatchEntry>,
     next_watch_id: u32,
     register_names_loaded: bool,
+    tracing: bool,
+    trace_steps_remaining: usize,
+    trace_max_steps: usize,
+    trace_refresh_pending: usize, // count of outstanding refresh queries during trace
+    trace_is_bp: bool,            // whether the current trace stop was a breakpoint
+    exec_args: Vec<String>,
 }
 
 impl GdbController {
@@ -133,6 +169,7 @@ impl GdbController {
     pub async fn spawn(
         config: &Config,
         state: SharedState,
+        recording: SharedRecording,
     ) -> Result<(mpsc::Sender<GdbCommand>, tokio::task::JoinHandle<Result<()>>)> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<GdbCommand>(64);
 
@@ -154,9 +191,15 @@ impl GdbController {
         }
 
         let target = config.target.clone();
+        let trace_depth = config.trace_depth;
+        let exec_args = match &config.target {
+            TargetMode::LaunchExec { args, .. } => args.clone(),
+            _ => Vec::new(),
+        };
         let handle = tokio::spawn(async move {
             let mut ctrl = GdbController {
                 state,
+                recording,
                 cmd_rx,
                 child: process.child,
                 stdin: process.stdin,
@@ -169,6 +212,12 @@ impl GdbController {
                 watch_expressions: Vec::new(),
                 next_watch_id: 1,
                 register_names_loaded: false,
+                tracing: false,
+                trace_steps_remaining: 0,
+                trace_max_steps: trace_depth,
+                trace_refresh_pending: 0,
+                trace_is_bp: false,
+                exec_args,
             };
             ctrl.initial_setup(&target).await?;
             ctrl.run_loop().await
@@ -184,12 +233,19 @@ impl GdbController {
     async fn initial_setup(&mut self, target: &TargetMode) -> Result<()> {
         match target {
             TargetMode::AttachPid(_) => {
-                // GDB attaches via the -p flag.  Once attached the inferior is
-                // stopped, so we can immediately query state.
+                self.update_snapshot(|snap| { snap.source_loading = true; });
                 self.send_thread_info().await?;
                 self.send_stack_list_frames().await?;
                 self.send_stack_list_locals().await?;
                 self.send_break_list().await?;
+                if !self.register_names_loaded {
+                    let (tok, mi) = self.commands.data_list_register_names();
+                    self.pending.insert(tok, PendingKind::RegisterNames);
+                    self.send_raw(&mi).await?;
+                }
+                let (tok, mi) = self.commands.data_list_register_values("x");
+                self.pending.insert(tok, PendingKind::RegisterValues);
+                self.send_raw(&mi).await?;
             }
             TargetMode::LaunchExec { .. } => {
                 // The executable is loaded automatically via the CLI arg.
@@ -401,6 +457,17 @@ impl GdbController {
     /// Dispatch a `^done` result to the handler matched by the pending command
     /// kind.
     async fn dispatch_done(&mut self, kind: PendingKind, body: &[(String, MiValue)]) {
+        let is_trace_refresh = self.tracing && matches!(
+            kind,
+            PendingKind::StackListFrames
+            | PendingKind::StackListLocals
+            | PendingKind::StackListLocalsSimple
+            | PendingKind::StackInfoFrame
+            | PendingKind::RegisterNames
+            | PendingKind::RegisterValues
+            | PendingKind::Disassemble
+        );
+
         match kind {
             PendingKind::ThreadInfo => {
                 self.process_thread_info(body);
@@ -408,12 +475,30 @@ impl GdbController {
             PendingKind::StackListFrames => {
                 self.process_stack_list_frames(body).await;
             }
-            PendingKind::StackListLocals => {
+            PendingKind::StackListLocals | PendingKind::StackListLocalsSimple => {
                 self.process_stack_list_locals(body);
+            }
+            PendingKind::StackInfoFrame => {
+                // Lightweight frame response: update just frame #0 in the stack
+                if let Some(frame_val) = MiBody::get(body, "frame") {
+                    if let Some(f) = parse_frame(frame_val) {
+                        self.update_snapshot(|snap| {
+                            if snap.stack.is_empty() {
+                                snap.stack.push(f.clone());
+                            } else {
+                                snap.stack[0] = f.clone();
+                            }
+                            snap.source_line = f.line;
+                            snap.has_debug_info = f.fullname.is_some();
+                        });
+                    }
+                }
             }
             PendingKind::StackSelectFrame(level) => {
                 // Load source for the newly selected frame.
                 self.load_source_for_frame(level).await;
+                // Load disassembly around the selected frame's address.
+                self.load_disasm_for_frame(level).await;
                 if let Err(e) = self.send_stack_list_locals().await {
                     warn!("failed to refresh locals after frame select: {e:#}");
                 }
@@ -456,8 +541,37 @@ impl GdbController {
                     }
                 });
             }
+            PendingKind::BreakCondition(num) => {
+                // Condition set successfully — refresh breakpoints to pick
+                // up the new condition text.
+                self.update_snapshot(|snap| {
+                    snap.push_output(
+                        OutputKind::Info,
+                        format!("Condition updated on breakpoint {num}"),
+                    );
+                });
+                if let Err(e) = self.send_break_list().await {
+                    warn!("failed to refresh breakpoints after condition: {e:#}");
+                }
+            }
+            PendingKind::BreakWatch => {
+                // Watchpoint created — refresh the full breakpoint list so
+                // it shows up in the panel.
+                if let Err(e) = self.send_break_list().await {
+                    warn!("failed to refresh breakpoints after watchpoint: {e:#}");
+                }
+            }
             PendingKind::BreakList => {
                 self.process_break_list(body);
+            }
+            PendingKind::SetRegister => {
+                // Register set — refresh register values to reflect the
+                // change in the panel.
+                let (tok, mi) = self.commands.data_list_register_values("x");
+                self.pending.insert(tok, PendingKind::RegisterValues);
+                if let Err(e) = self.send_raw(&mi).await {
+                    warn!("failed to refresh registers after set: {e:#}");
+                }
             }
             PendingKind::RegisterNames => {
                 self.process_register_names(body);
@@ -548,6 +662,84 @@ impl GdbController {
             PendingKind::CliCommand => {
                 debug!("CLI command complete");
             }
+            PendingKind::SearchMemory => {
+                debug!("memory search complete (results in console output)");
+            }
+            PendingKind::TypeOverlay { addr, type_expr } => {
+                // Parse the GDB result value to extract struct fields
+                let value = MiBody::get_str(body, "value").unwrap_or("").to_string();
+                let fields = parse_struct_fields(&value);
+                let overlay = TypeOverlay {
+                    type_name: type_expr.clone(),
+                    address: addr,
+                    total_size: 0, // not available without ptype parsing
+                    fields,
+                };
+                let field_count = overlay.fields.len();
+                self.update_snapshot(|snap| {
+                    if field_count == 0 {
+                        snap.push_output(
+                            OutputKind::Console,
+                            format!("*({type_expr}*)0x{addr:x} = {value}"),
+                        );
+                    } else {
+                        snap.push_output(
+                            OutputKind::Info,
+                            format!("Type overlay: ({type_expr}*)0x{addr:x} — {field_count} fields"),
+                        );
+                        for f in &overlay.fields {
+                            snap.push_output(
+                                OutputKind::Console,
+                                format!("  .{} = {}", f.name, f.value),
+                            );
+                        }
+                    }
+                    snap.type_overlay = Some(overlay);
+                });
+            }
+            PendingKind::ListFunctions => {
+                self.process_function_list(body);
+            }
+            PendingKind::ResolveSymbol => {
+                debug!("info symbol complete (results in console output)");
+            }
+            PendingKind::PatchBytes { addr, byte_count } => {
+                debug!("patch bytes complete at {addr:#x}");
+                // Re-read the disassembly around the patched address so the
+                // panel reflects the new instructions.
+                let start = addr.saturating_sub(32);
+                let end = addr.saturating_add(96);
+                let (tok, mi) = self.commands.data_disassemble_addr(start, end);
+                self.pending.insert(tok, PendingKind::Disassemble);
+                if let Err(e) = self.send_raw(&mi).await {
+                    warn!("failed to refresh disasm after patch: {e:#}");
+                }
+                // Also re-read memory if the memory panel is viewing this area.
+                let snap = self.state.load();
+                let mem_start = snap.memory_address;
+                let mem_len = snap.memory.as_ref().map_or(0, |m| m.bytes.len());
+                drop(snap);
+                if mem_len > 0
+                    && addr >= mem_start
+                    && addr < mem_start + mem_len as u64
+                {
+                    if let Err(e) = self.send_read_memory(mem_start, mem_len).await {
+                        warn!("failed to refresh memory after patch: {e:#}");
+                    }
+                }
+                self.update_snapshot(|snap| {
+                    snap.push_output(
+                        OutputKind::Info,
+                        format!("Patched {} byte(s) at {addr:#x}", byte_count),
+                    );
+                });
+            }
+        }
+
+        // If we're tracing and this was a trace-refresh response, check if
+        // all refresh queries are done so we can capture + step.
+        if is_trace_refresh && self.trace_refresh_pending > 0 {
+            self.trace_refresh_done().await;
         }
     }
 
@@ -613,6 +805,8 @@ impl GdbController {
                     }
                 };
 
+                let is_bp = matches!(reason, StopReason::BreakpointHit { .. } | StopReason::Watchpoint { .. });
+
                 self.update_snapshot(|snap| {
                     snap.target_state = TargetState::Stopped;
                     snap.stop_reason = Some(reason);
@@ -620,9 +814,32 @@ impl GdbController {
                     snap.status_message = Some(status);
                 });
 
-                // Auto-refresh cascade
-                if let Err(e) = self.auto_refresh_on_stop().await {
-                    warn!("auto-refresh on stop failed: {e:#}");
+                if self.tracing {
+                    self.trace_is_bp = is_bp;
+                    if !is_bp && self.trace_steps_remaining > 0 {
+                        self.trace_steps_remaining -= 1;
+                    }
+                    let steps_done = self.trace_max_steps - self.trace_steps_remaining;
+                    self.update_snapshot(|snap| {
+                        snap.status_message = Some(format!(
+                            "Tracing... step {steps_done}/{}",
+                            self.trace_max_steps
+                        ));
+                    });
+
+                    // Send optimized queries (stack-info-frame + simple locals)
+                    // then capture + step when all responses arrive.
+                    self.trace_refresh_pending = 0;
+                    if let Err(e) = self.send_trace_refresh().await {
+                        warn!("trace refresh failed: {e:#}");
+                        self.tracing = false;
+                    }
+                } else {
+                    // Normal (non-trace) stop: full refresh + capture
+                    if let Err(e) = self.auto_refresh_on_stop().await {
+                        warn!("auto-refresh on stop failed: {e:#}");
+                    }
+                    self.capture_recording_with_anchor(is_bp);
                 }
             }
             "running" => {
@@ -676,7 +893,7 @@ impl GdbController {
                     );
                 });
             }
-            "breakpoint-modified" => {
+            "breakpoint-modified" | "breakpoint-created" => {
                 if let Some(bkpt_val) = MiBody::get(body, "bkpt") {
                     if let Some(bp) = parse_breakpoint(bkpt_val) {
                         self.update_snapshot(|snap| {
@@ -686,16 +903,54 @@ impl GdbController {
                                 .find(|b| b.number == bp.number)
                             {
                                 *existing = bp;
+                            } else {
+                                snap.breakpoints.push(bp);
                             }
                         });
                     }
                 }
             }
-            "library-loaded" | "library-unloaded" => {
-                let lib = MiBody::get_str(body, "id")
-                    .or_else(|| MiBody::get_str(body, "target-name"))
-                    .unwrap_or("?");
-                debug!("{class}: {lib}");
+            "breakpoint-deleted" => {
+                if let Some(id_str) = MiBody::get_str(body, "id") {
+                    if let Ok(id) = id_str.parse::<u32>() {
+                        self.update_snapshot(|snap| {
+                            snap.breakpoints.retain(|b| b.number != id);
+                        });
+                    }
+                }
+            }
+            "library-loaded" => {
+                let name = MiBody::get_str(body, "id").unwrap_or("?").to_string();
+                let target_name = MiBody::get_str(body, "target-name").unwrap_or("?").to_string();
+                let syms = MiBody::get_str(body, "symbols-loaded")
+                    .map(|s| s == "1")
+                    .unwrap_or(false);
+                let ranges = MiBody::get(body, "ranges");
+                let base_addr = ranges.and_then(|r| {
+                    if let Some(vals) = r.as_list_values() {
+                        vals.first()
+                            .and_then(|v| v.get_str("from"))
+                            .and_then(parse_hex_u64)
+                    } else {
+                        None
+                    }
+                });
+                debug!("library-loaded: {name}");
+                self.update_snapshot(|snap| {
+                    snap.mapped_libs.push(MappedLibrary {
+                        name,
+                        target_name,
+                        base_addr,
+                        symbols_loaded: syms,
+                    });
+                });
+            }
+            "library-unloaded" => {
+                let name = MiBody::get_str(body, "id").unwrap_or("").to_string();
+                debug!("library-unloaded: {name}");
+                self.update_snapshot(|snap| {
+                    snap.mapped_libs.retain(|l| l.name != name);
+                });
             }
             "thread-group-added" | "cmd-param-changed" | "memory-changed" => {
                 debug!("notify: {class}");
@@ -713,13 +968,28 @@ impl GdbController {
     async fn handle_command(&mut self, cmd: GdbCommand) -> Result<()> {
         match cmd {
             GdbCommand::Run(args) => {
-                let (tok, mi) = self.commands.exec_run(&args);
+                let run_args = if args.is_empty() { &self.exec_args } else { &args };
+                let (tok, mi) = self.commands.exec_run(run_args);
                 self.pending.insert(tok, PendingKind::ExecRun);
                 self.send_raw(&mi).await?;
             }
             GdbCommand::Continue => {
+                self.tracing = false;
                 let (tok, mi) = self.commands.exec_continue();
                 self.pending.insert(tok, PendingKind::ExecContinue);
+                self.send_raw(&mi).await?;
+            }
+            GdbCommand::TraceContinue | GdbCommand::TraceContinueFull => {
+                self.tracing = true;
+                self.trace_steps_remaining = self.trace_max_steps;
+                self.update_snapshot(|snap| {
+                    snap.status_message = Some(format!(
+                        "Tracing... step 0/{}",
+                        self.trace_max_steps
+                    ));
+                });
+                let (tok, mi) = self.commands.exec_next();
+                self.pending.insert(tok, PendingKind::ExecNext);
                 self.send_raw(&mi).await?;
             }
             GdbCommand::StepOver => {
@@ -738,9 +1008,16 @@ impl GdbController {
                 self.send_raw(&mi).await?;
             }
             GdbCommand::Interrupt => {
+                self.tracing = false;
+                // Send MI interrupt command
                 let (tok, mi) = self.commands.exec_interrupt();
                 self.pending.insert(tok, PendingKind::ExecInterrupt);
-                self.send_raw(&mi).await?;
+                let _ = self.send_raw(&mi).await;
+                // Also send SIGINT to the GDB process as a fallback — GDB
+                // forwards it to the inferior.
+                if let Some(pid) = self.child.id() {
+                    unsafe { libc::kill(pid as i32, libc::SIGINT); }
+                }
             }
             GdbCommand::SelectThread(id) => {
                 let (tok, mi) = self.commands.thread_select(id);
@@ -758,6 +1035,21 @@ impl GdbController {
             GdbCommand::SetBreakpoint(location) => {
                 let (tok, mi) = self.commands.break_insert(&location);
                 self.pending.insert(tok, PendingKind::BreakInsert);
+                self.send_raw(&mi).await?;
+            }
+            GdbCommand::SetBreakpointCond { location, condition } => {
+                let (tok, mi) = self.commands.break_insert_cond(&location, &condition);
+                self.pending.insert(tok, PendingKind::BreakInsert);
+                self.send_raw(&mi).await?;
+            }
+            GdbCommand::BreakCondition { number, condition } => {
+                let (tok, mi) = self.commands.break_condition(number, &condition);
+                self.pending.insert(tok, PendingKind::BreakCondition(number));
+                self.send_raw(&mi).await?;
+            }
+            GdbCommand::SetWatchpoint { expr, kind } => {
+                let (tok, mi) = self.commands.break_watch(&expr, kind);
+                self.pending.insert(tok, PendingKind::BreakWatch);
                 self.send_raw(&mi).await?;
             }
             GdbCommand::DeleteBreakpoint(num) => {
@@ -783,6 +1075,11 @@ impl GdbController {
                     self.pending.insert(tok, PendingKind::BreakEnable(num));
                     self.send_raw(&mi).await?;
                 }
+            }
+            GdbCommand::SetRegister { name, value } => {
+                let (tok, mi) = self.commands.set_register(&name, &value);
+                self.pending.insert(tok, PendingKind::SetRegister);
+                self.send_raw(&mi).await?;
             }
             GdbCommand::RefreshRegisters => {
                 if !self.register_names_loaded {
@@ -867,6 +1164,102 @@ impl GdbController {
                     snap.watch_expressions.retain(|w| w.id != id);
                 });
             }
+            GdbCommand::SearchMemoryString { start, length, pattern } => {
+                let (tok, mi) = self.commands.find_string(start, length, &pattern);
+                self.pending.insert(tok, PendingKind::SearchMemory);
+                self.send_raw(&mi).await?;
+                self.update_snapshot(|snap| {
+                    snap.push_output(
+                        OutputKind::Info,
+                        format!("Searching for \"{}\" from {start:#x} ({length} bytes)...", pattern),
+                    );
+                });
+            }
+            GdbCommand::SearchMemoryBytes { start, length, bytes } => {
+                let (tok, mi) = self.commands.find_bytes(start, length, &bytes);
+                self.pending.insert(tok, PendingKind::SearchMemory);
+                self.send_raw(&mi).await?;
+                let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                self.update_snapshot(|snap| {
+                    snap.push_output(
+                        OutputKind::Info,
+                        format!("Searching for bytes [{hex}] from {start:#x} ({length} bytes)..."),
+                    );
+                });
+            }
+            GdbCommand::PatchBytes { addr, bytes } => {
+                let count = bytes.len();
+                let (tok, mi) = self.commands.data_write_memory_bytes(addr, &bytes);
+                self.pending.insert(tok, PendingKind::PatchBytes { addr, byte_count: count });
+                self.send_raw(&mi).await?;
+            }
+            GdbCommand::AnalyzeXrefs { addr } => {
+                // Perform xref analysis locally using the current disassembly snapshot.
+                let xrefs = self.analyze_xrefs_local(addr);
+                let target_name = {
+                    let snap = self.state.load();
+                    snap.disasm.iter()
+                        .find(|i| i.address == addr)
+                        .and_then(|i| i.func_name.clone())
+                        .unwrap_or_else(|| format!("0x{addr:x}"))
+                };
+                let count = xrefs.len();
+                self.update_snapshot(|snap| {
+                    // Build summary for the output panel
+                    if xrefs.is_empty() {
+                        snap.push_output(
+                            OutputKind::Info,
+                            format!("No xrefs found for {target_name} (0x{addr:x}) in current disassembly window"),
+                        );
+                    } else {
+                        snap.push_output(
+                            OutputKind::Info,
+                            format!("Xrefs for {target_name} (0x{addr:x}): {count} found"),
+                        );
+                        for xref in &xrefs {
+                            let direction = match xref.xref_type {
+                                XrefType::CallTo => "Called by",
+                                XrefType::CallFrom => "Calls",
+                                XrefType::JumpTo => "Jump from",
+                            };
+                            let name = xref.func_name.as_deref().unwrap_or("??");
+                            snap.push_output(
+                                OutputKind::Console,
+                                format!("  {direction}: 0x{:x} <{name}>  {}", xref.address, xref.context),
+                            );
+                        }
+                    }
+                    snap.xrefs = xrefs;
+                });
+            }
+            GdbCommand::TypeOverlay { addr, type_expr } => {
+                // Send the expression evaluation to GDB: *(type*)addr
+                let (tok, mi) = self.commands.print_typed(&type_expr, addr);
+                self.pending.insert(tok, PendingKind::TypeOverlay { addr, type_expr });
+                self.send_raw(&mi).await?;
+            }
+            GdbCommand::ListFunctions(pattern) => {
+                let (tok, mi) = self.commands.symbol_info_functions(pattern.as_deref());
+                self.pending.insert(tok, PendingKind::ListFunctions);
+                self.send_raw(&mi).await?;
+                let msg = match &pattern {
+                    Some(p) => format!("Searching functions matching '{p}'..."),
+                    None => "Listing all functions...".into(),
+                };
+                self.update_snapshot(|snap| {
+                    snap.push_output(OutputKind::Info, msg);
+                });
+            }
+            GdbCommand::ResolveSymbol(addr) => {
+                let (tok, mi) = self.commands.info_symbol(addr);
+                self.pending.insert(tok, PendingKind::ResolveSymbol);
+                self.send_raw(&mi).await?;
+            }
+            GdbCommand::RefreshLibraries => {
+                let (tok, mi) = self.commands.cli_command("info sharedlibrary");
+                self.pending.insert(tok, PendingKind::CliCommand);
+                self.send_raw(&mi).await?;
+            }
             GdbCommand::RawCommand(raw) => {
                 let (tok, mi) = self.commands.cli_command(&raw);
                 self.pending.insert(tok, PendingKind::CliCommand);
@@ -921,6 +1314,77 @@ impl GdbController {
 
     /// Send all commands needed after the target stops: thread info, stack,
     /// locals, breakpoints, and (if previously requested) registers + watches.
+    /// Send refresh queries during tracing. Unlike auto_refresh_on_stop,
+    /// this tracks how many responses are outstanding so we know when to
+    /// capture state and issue the next step.
+    async fn send_trace_refresh(&mut self) -> Result<()> {
+        // Optimized trace queries: use stack-info-frame (current frame only,
+        // not full backtrace) and simple-values for locals (skip complex
+        // type evaluation). Skip registers — they're captured on final stop.
+        // This gives ~120 steps/sec vs ~25 with full queries.
+
+        let (tok, mi) = self.commands.stack_info_frame();
+        self.pending.insert(tok, PendingKind::StackInfoFrame);
+        self.send_raw(&mi).await?;
+        self.trace_refresh_pending += 1;
+
+        let (tok, mi) = self.commands.stack_list_locals_simple();
+        self.pending.insert(tok, PendingKind::StackListLocalsSimple);
+        self.send_raw(&mi).await?;
+        self.trace_refresh_pending += 1;
+
+        Ok(())
+    }
+
+    /// Called when a trace-mode refresh response arrives. When all pending
+    /// refreshes are done, capture the full state and issue the next step
+    /// (or stop tracing if we've hit a breakpoint or exhausted steps).
+    async fn trace_refresh_done(&mut self) {
+        if self.trace_refresh_pending == 0 {
+            return;
+        }
+        self.trace_refresh_pending -= 1;
+        if self.trace_refresh_pending > 0 {
+            return; // still waiting for more responses
+        }
+
+        // All refreshes complete — capture full state
+        self.capture_recording_with_anchor(self.trace_is_bp);
+
+        // Decide whether to continue tracing or stop
+        if self.trace_is_bp || self.trace_steps_remaining == 0 {
+            let steps_done = self.trace_max_steps - self.trace_steps_remaining;
+            self.tracing = false;
+            if self.trace_is_bp {
+                self.update_snapshot(|snap| {
+                    snap.status_message = Some(format!(
+                        "Breakpoint hit after {steps_done} traced steps"
+                    ));
+                });
+            } else {
+                self.update_snapshot(|snap| {
+                    snap.status_message = Some(format!(
+                        "Trace complete ({steps_done} steps captured)"
+                    ));
+                });
+            }
+            // Full refresh now that tracing is done — load source + disasm
+            // for the final stopped position so the TUI shows current state.
+            let level = self.state.load().current_frame_level;
+            self.load_source_for_frame(level).await;
+            self.load_disasm_for_frame(level).await;
+            return;
+        }
+
+        // Issue next step
+        let (tok, mi) = self.commands.exec_next();
+        self.pending.insert(tok, PendingKind::ExecNext);
+        if let Err(e) = self.send_raw(&mi).await {
+            warn!("trace auto-step failed: {e:#}");
+            self.tracing = false;
+        }
+    }
+
     async fn auto_refresh_on_stop(&mut self) -> Result<()> {
         self.update_snapshot(|snap| {
             snap.source_loading = true;
@@ -930,11 +1394,18 @@ impl GdbController {
         self.send_stack_list_locals().await?;
         self.send_break_list().await?;
 
-        if self.register_names_loaded {
-            let (tok, mi) = self.commands.data_list_register_values("x");
-            self.pending.insert(tok, PendingKind::RegisterValues);
+        // Note: disassembly is loaded in process_stack_list_frames() after
+        // the stack response arrives (so we have the actual PC address).
+
+        // Always load register names (if not yet loaded) then values
+        if !self.register_names_loaded {
+            let (tok, mi) = self.commands.data_list_register_names();
+            self.pending.insert(tok, PendingKind::RegisterNames);
             self.send_raw(&mi).await?;
         }
+        let (tok, mi) = self.commands.data_list_register_values("x");
+        self.pending.insert(tok, PendingKind::RegisterValues);
+        self.send_raw(&mi).await?;
 
         // Clone the list to avoid borrowing self while iterating.
         let entries: Vec<WatchEntry> = self.watch_expressions.clone();
@@ -990,7 +1461,28 @@ impl GdbController {
             self.update_snapshot(|s| {
                 s.source = None;
                 s.source_line = None;
+                s.source_loading = false;
             });
+        }
+    }
+
+    /// Load disassembly around the address of the frame at `level`.
+    async fn load_disasm_for_frame(&mut self, level: u32) {
+        let snap = self.state.load();
+        let pc = snap.stack.iter()
+            .find(|f| f.level == level)
+            .or_else(|| snap.stack.first())
+            .map(|f| f.addr)
+            .unwrap_or(0);
+        drop(snap);
+        if pc != 0 {
+            let start = pc.saturating_sub(64);
+            let end = pc.saturating_add(128);
+            let (tok, mi) = self.commands.data_disassemble_addr(start, end);
+            self.pending.insert(tok, PendingKind::Disassemble);
+            if let Err(e) = self.send_raw(&mi).await {
+                warn!("failed to load disassembly for frame {level}: {e:#}");
+            }
         }
     }
 
@@ -1090,13 +1582,25 @@ impl GdbController {
             }
         }
 
+        let has_debug = frames.first().map_or(false, |f| f.fullname.is_some());
         self.update_snapshot(|snap| {
+            snap.has_debug_info = has_debug;
             snap.stack = frames;
         });
 
-        // Load source for the frame at current_frame_level (or frame #0).
-        let level = self.state.load().current_frame_level;
-        self.load_source_for_frame(level).await;
+        if self.tracing {
+            // During tracing, skip source file I/O and disasm to keep steps
+            // fast.  source_line is set from the *stopped frame info; source
+            // files are loaded on demand during playback.
+            self.update_snapshot(|snap| {
+                snap.source_loading = false;
+            });
+        } else {
+            // Normal stop: load source file and disassembly.
+            let level = self.state.load().current_frame_level;
+            self.load_source_for_frame(level).await;
+            self.load_disasm_for_frame(level).await;
+        }
     }
 
     fn process_stack_list_locals(&mut self, body: &[(String, MiValue)]) {
@@ -1248,6 +1752,60 @@ impl GdbController {
         }
     }
 
+    fn process_function_list(&mut self, body: &[(String, MiValue)]) {
+        // Parse -symbol-info-functions response:
+        // ^done,symbols={debug=[{filename="...",fullname="...",symbols=[{line="N",name="func",...}]}]}
+        let mut entries: Vec<String> = Vec::new();
+
+        if let Some(symbols) = MiBody::get(body, "symbols") {
+            // Process debug symbols
+            for section in &["debug", "nondebug"] {
+                if let Some(file_list) = symbols.get(section) {
+                    if let Some(files) = file_list.as_list_values() {
+                        for file_val in files {
+                            let filename = file_val.get_str("filename").unwrap_or("??");
+                            let short = filename.rsplit('/').next().unwrap_or(filename);
+                            if let Some(sym_list) = file_val.get("symbols") {
+                                if let Some(syms) = sym_list.as_list_values() {
+                                    for sym in syms {
+                                        let name = sym.get_str("name").unwrap_or("??");
+                                        let desc = sym.get_str("description").unwrap_or("");
+                                        let line = sym.get_str("line").unwrap_or("");
+                                        if !line.is_empty() {
+                                            entries.push(format!("  {name:<40} {short}:{line}"));
+                                        } else if !desc.is_empty() {
+                                            entries.push(format!("  {name:<40} {desc}"));
+                                        } else {
+                                            entries.push(format!("  {name:<40} {short}"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let count = entries.len();
+        // Cap output to prevent flooding
+        let truncated = entries.len() > 200;
+        entries.truncate(200);
+
+        self.update_snapshot(|snap| {
+            snap.push_output(OutputKind::Info, format!("--- Functions ({count} found) ---"));
+            for entry in entries {
+                snap.push_output(OutputKind::Console, entry);
+            }
+            if truncated {
+                snap.push_output(
+                    OutputKind::Info,
+                    format!("... truncated at 200 of {count}. Use f with a filter pattern."),
+                );
+            }
+        });
+    }
+
     fn process_disassemble(&mut self, body: &[(String, MiValue)]) {
         let mut instructions = Vec::new();
 
@@ -1369,12 +1927,122 @@ impl GdbController {
     // Snapshot update helper
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Cross-reference analysis (local, no GDB round-trip)
+    // -----------------------------------------------------------------------
+
+    /// Analyze cross-references for a given address using the current
+    /// disassembly snapshot.  This is purely local — no MI commands are sent.
+    fn analyze_xrefs_local(&self, target_addr: u64) -> Vec<XrefEntry> {
+        let snap = self.state.load();
+        let mut xrefs = Vec::new();
+
+        // Find the function name at the target address (if any)
+        let target_func = snap.disasm.iter()
+            .find(|i| i.address == target_addr)
+            .and_then(|i| i.func_name.clone());
+
+        for inst in &snap.disasm {
+            // Check if this instruction calls/jumps TO our target
+            if let Some(call_target) = parse_call_target(&inst.inst) {
+                if call_target == target_addr {
+                    xrefs.push(XrefEntry {
+                        address: inst.address,
+                        func_name: inst.func_name.clone(),
+                        xref_type: XrefType::CallTo,
+                        context: inst.inst.clone(),
+                    });
+                }
+            }
+
+            // Check if the target address itself makes calls/jumps (outgoing)
+            if inst.address == target_addr {
+                if let Some(call_target) = parse_call_target(&inst.inst) {
+                    // Find the name of whatever it calls
+                    let callee_name = snap.disasm.iter()
+                        .find(|i| i.address == call_target)
+                        .and_then(|i| i.func_name.clone());
+                    let xref_type = if inst.inst.trim().starts_with("call")
+                        || inst.inst.trim().starts_with("bl")
+                    {
+                        XrefType::CallFrom
+                    } else {
+                        XrefType::JumpTo
+                    };
+                    xrefs.push(XrefEntry {
+                        address: call_target,
+                        func_name: callee_name,
+                        xref_type,
+                        context: inst.inst.clone(),
+                    });
+                }
+            }
+        }
+
+        // Also scan for any instructions in the same function that call/jump
+        // to the target, if the target is a function entry point (offset == 0
+        // or Some(0)).
+        if let Some(ref func_name) = target_func {
+            for inst in &snap.disasm {
+                if inst.func_name.as_ref() != Some(func_name) {
+                    // Only look at instructions in OTHER functions
+                    if let Some(call_target) = parse_call_target(&inst.inst) {
+                        // Does this call target land within the target function?
+                        // We already captured exact address matches above, but
+                        // check for the function name in angle brackets as well.
+                        if call_target != target_addr {
+                            // Check if the instruction text references the function
+                            if inst.inst.contains(&format!("<{func_name}>"))
+                                || inst.inst.contains(&format!("<{func_name}+"))
+                                || inst.inst.contains(&format!("<{func_name}@"))
+                            {
+                                // Avoid duplicates
+                                let already = xrefs.iter().any(|x| x.address == inst.address);
+                                if !already {
+                                    xrefs.push(XrefEntry {
+                                        address: inst.address,
+                                        func_name: inst.func_name.clone(),
+                                        xref_type: XrefType::CallTo,
+                                        context: inst.inst.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        xrefs
+    }
+
+    // -----------------------------------------------------------------------
+    // Snapshot update helper
+    // -----------------------------------------------------------------------
+
     /// Clone the current snapshot, apply the mutation, and publish the new
     /// version atomically via ArcSwap.
     fn update_snapshot(&self, f: impl FnOnce(&mut GdbSnapshot)) {
         let mut snap = (**self.state.load()).clone();
         f(&mut snap);
         self.state.store(Arc::new(snap));
+    }
+
+    /// Capture the current snapshot into the recording buffer.
+    fn capture_recording_with_anchor(&self, is_anchor: bool) {
+        if let Ok(mut rec) = self.recording.lock() {
+            let snap = self.state.load();
+            if is_anchor {
+                rec.capture_anchor(&snap);
+            } else {
+                rec.capture(&snap);
+            }
+            let count = rec.len();
+            drop(rec);
+            self.update_snapshot(|s| {
+                s.recording_count = count;
+            });
+        }
     }
 }
 
@@ -1457,6 +2125,7 @@ fn parse_breakpoint(val: &MiValue) -> Option<Breakpoint> {
         .get_str("original-location")
         .unwrap_or("")
         .to_string();
+    let condition = val.get_str("cond").map(String::from);
 
     Some(Breakpoint {
         number,
@@ -1468,6 +2137,7 @@ fn parse_breakpoint(val: &MiValue) -> Option<Breakpoint> {
         line,
         hit_count,
         original_location,
+        condition,
     })
 }
 
@@ -1552,4 +2222,205 @@ fn tuple_get_str<'a>(pairs: &'a [(String, MiValue)], key: &str) -> &'a str {
         .find(|(k, _)| k == key)
         .and_then(|(_, v)| v.as_const())
         .unwrap_or("")
+}
+
+// ===========================================================================
+// Analysis helpers — xref parsing, type overlay field parsing
+// ===========================================================================
+
+/// Parse a call/jmp target address from an instruction string.
+///
+/// Handles formats like:
+/// - `call   0x401000 <printf@plt>`
+/// - `jmp    0x401020`
+/// - `je     0x401030 <main+0x10>`
+/// - `callq  *0x401000(%rip)`
+fn parse_call_target(inst: &str) -> Option<u64> {
+    let trimmed = inst.trim();
+    let lower = trimmed.to_lowercase();
+
+    // Must start with a call/jump mnemonic
+    let is_branch = lower.starts_with("call")
+        || lower.starts_with("jmp")
+        || lower.starts_with("je")
+        || lower.starts_with("jne")
+        || lower.starts_with("jg")
+        || lower.starts_with("jl")
+        || lower.starts_with("jge")
+        || lower.starts_with("jle")
+        || lower.starts_with("ja")
+        || lower.starts_with("jb")
+        || lower.starts_with("jae")
+        || lower.starts_with("jbe")
+        || lower.starts_with("jz")
+        || lower.starts_with("jnz")
+        || lower.starts_with("js")
+        || lower.starts_with("jns")
+        || lower.starts_with("jo")
+        || lower.starts_with("jno")
+        || lower.starts_with("jp")
+        || lower.starts_with("jnp")
+        || lower.starts_with("bl")
+        || lower.starts_with("b.");
+
+    if !is_branch {
+        return None;
+    }
+
+    // Find a hex address in the operand portion (after the mnemonic)
+    for word in trimmed.split_whitespace().skip(1) {
+        let clean = word
+            .trim_start_matches("0x")
+            .trim_start_matches("0X")
+            .trim_start_matches('*');
+        // Stop at non-hex characters (e.g. angle bracket from "<func>")
+        let hex_part: String = clean.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+        if !hex_part.is_empty() {
+            if let Ok(addr) = u64::from_str_radix(&hex_part, 16) {
+                return Some(addr);
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse GDB's struct output format `{field1 = val1, field2 = val2, ...}`
+/// into individual field entries.
+fn parse_struct_fields(value: &str) -> Vec<TypeOverlayField> {
+    let trimmed = value.trim();
+    // If it doesn't look like a struct, return empty
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return Vec::new();
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let mut fields = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for ch in inner.chars() {
+        if escape_next {
+            current.push(ch);
+            escape_next = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            current.push(ch);
+            escape_next = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            current.push(ch);
+            continue;
+        }
+        if in_string {
+            current.push(ch);
+            continue;
+        }
+        match ch {
+            '{' => {
+                depth += 1;
+                current.push(ch);
+            }
+            '}' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                if let Some(field) = parse_single_field(&current) {
+                    fields.push(field);
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        if let Some(field) = parse_single_field(&current) {
+            fields.push(field);
+        }
+    }
+    fields
+}
+
+/// Parse a single `name = value` pair from GDB struct output.
+fn parse_single_field(s: &str) -> Option<TypeOverlayField> {
+    let parts: Vec<&str> = s.splitn(2, '=').collect();
+    if parts.len() == 2 {
+        let name = parts[0].trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+        Some(TypeOverlayField {
+            name,
+            type_name: String::new(),
+            offset: 0,
+            size: 0,
+            value: parts[1].trim().to_string(),
+        })
+    } else {
+        None
+    }
+}
+
+// ===========================================================================
+// Tests for analysis helpers
+// ===========================================================================
+
+#[cfg(test)]
+mod analysis_tests {
+    use super::*;
+
+    #[test]
+    fn parse_call_target_basic() {
+        assert_eq!(parse_call_target("call   0x401000 <printf@plt>"), Some(0x401000));
+        assert_eq!(parse_call_target("callq  0x401234"), Some(0x401234));
+        assert_eq!(parse_call_target("jmp    0x401020"), Some(0x401020));
+        assert_eq!(parse_call_target("je     0x401030 <main+0x10>"), Some(0x401030));
+    }
+
+    #[test]
+    fn parse_call_target_non_branch() {
+        assert_eq!(parse_call_target("mov    $0x401000,%rax"), None);
+        assert_eq!(parse_call_target("push   %rbp"), None);
+        assert_eq!(parse_call_target("nop"), None);
+    }
+
+    #[test]
+    fn parse_struct_fields_basic() {
+        let fields = parse_struct_fields("{x = 42, name = \"hello\", ptr = 0x7fff5000}");
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name, "x");
+        assert_eq!(fields[0].value, "42");
+        assert_eq!(fields[1].name, "name");
+        assert_eq!(fields[1].value, "\"hello\"");
+        assert_eq!(fields[2].name, "ptr");
+        assert_eq!(fields[2].value, "0x7fff5000");
+    }
+
+    #[test]
+    fn parse_struct_fields_nested() {
+        let fields = parse_struct_fields("{a = 1, inner = {x = 2, y = 3}, b = 4}");
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name, "a");
+        assert_eq!(fields[0].value, "1");
+        assert_eq!(fields[1].name, "inner");
+        assert_eq!(fields[1].value, "{x = 2, y = 3}");
+        assert_eq!(fields[2].name, "b");
+        assert_eq!(fields[2].value, "4");
+    }
+
+    #[test]
+    fn parse_struct_fields_non_struct() {
+        assert!(parse_struct_fields("42").is_empty());
+        assert!(parse_struct_fields("0x7fff5000").is_empty());
+    }
+
+    #[test]
+    fn parse_struct_fields_empty() {
+        assert!(parse_struct_fields("{}").is_empty());
+    }
 }

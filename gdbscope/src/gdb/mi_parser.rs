@@ -722,4 +722,29 @@ mod tests {
             other => panic!("expected Result, got {:?}", other),
         }
     }
+
+    #[test]
+    fn breakpoint_table() {
+        let line = r#"^done,BreakpointTable={nr_rows="2",nr_cols="6",hdr=[{width="7",alignment="-1",col_name="number",colhdr="Num"}],body=[bkpt={number="1",type="breakpoint",enabled="y",func="main",file="test.c",line="8",times="0",original-location="main"},bkpt={number="2",type="breakpoint",enabled="y",func="add",file="test.c",line="4",times="0",original-location="add"}]}"#;
+        let record = parse_line(line).unwrap();
+        match record {
+            MiRecord::Result { body, .. } => {
+                let table = MiBody::get(body.as_slice(), "BreakpointTable").unwrap();
+                let bkpt_body = table.get("body").unwrap();
+                match bkpt_body {
+                    MiValue::List(MiList::Results(pairs)) => {
+                        assert_eq!(pairs.len(), 2);
+                        assert_eq!(pairs[0].0, "bkpt");
+                        assert_eq!(pairs[0].1.get_str("number"), Some("1"));
+                        assert_eq!(pairs[0].1.get_str("func"), Some("main"));
+                        assert_eq!(pairs[1].0, "bkpt");
+                        assert_eq!(pairs[1].1.get_str("number"), Some("2"));
+                        assert_eq!(pairs[1].1.get_str("func"), Some("add"));
+                    }
+                    other => panic!("expected Results list, got {:?}", other),
+                }
+            }
+            other => panic!("expected Result, got {:?}", other),
+        }
+    }
 }

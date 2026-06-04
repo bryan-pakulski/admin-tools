@@ -72,13 +72,29 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
                 String::new()
             };
 
+            // Show condition if present
+            let cond_text = bp.condition.as_ref().map(|c| format!(" if {c}")).unwrap_or_default();
+
+            // Show breakpoint type tag for watchpoints
+            let type_tag = if bp.bp_type.contains("watchpoint") {
+                if bp.bp_type.contains("acc") || bp.bp_type.contains("access") {
+                    " [rw]"
+                } else if bp.bp_type.contains("read") {
+                    " [rd]"
+                } else {
+                    " [wp]"
+                }
+            } else {
+                ""
+            };
+
             if is_selected && focused {
                 let style = Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD);
                 Line::from(Span::styled(
-                    format!("{enabled_icon} #{:<3} {location:<30} {func_info}{hits}",
+                    format!("{enabled_icon} #{:<3} {location:<30} {func_info}{type_tag}{cond_text}{hits}",
                         bp.number),
                     style,
                 ))
@@ -101,6 +117,18 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
                     spans.push(Span::styled(
                         format!(" {func_info}"),
                         Style::default().fg(Color::Yellow),
+                    ));
+                }
+                if !type_tag.is_empty() {
+                    spans.push(Span::styled(
+                        type_tag.to_string(),
+                        Style::default().fg(Color::Magenta),
+                    ));
+                }
+                if !cond_text.is_empty() {
+                    spans.push(Span::styled(
+                        cond_text,
+                        Style::default().fg(Color::Cyan),
                     ));
                 }
                 if !hits.is_empty() {

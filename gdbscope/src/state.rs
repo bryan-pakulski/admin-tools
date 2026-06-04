@@ -89,6 +89,7 @@ pub struct Breakpoint {
     pub line: Option<u32>,
     pub hit_count: u32,
     pub original_location: String,
+    pub condition: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +123,62 @@ pub struct DisasmInstruction {
     pub func_name: Option<String>,
     pub offset: Option<u32>,
     pub inst: String,
+}
+
+// ---------------------------------------------------------------------------
+// Cross-references (xrefs)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XrefType {
+    /// Something calls the target address.
+    CallTo,
+    /// The target address calls this address.
+    CallFrom,
+    /// A jump to the target address.
+    JumpTo,
+}
+
+#[derive(Debug, Clone)]
+pub struct XrefEntry {
+    pub address: u64,
+    pub func_name: Option<String>,
+    pub xref_type: XrefType,
+    /// The instruction text at the xref site.
+    pub context: String,
+}
+
+// ---------------------------------------------------------------------------
+// Type overlay
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct TypeOverlayField {
+    pub name: String,
+    pub type_name: String,
+    pub offset: usize,
+    pub size: usize,
+    pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeOverlay {
+    pub type_name: String,
+    pub address: u64,
+    pub total_size: usize,
+    pub fields: Vec<TypeOverlayField>,
+}
+
+// ---------------------------------------------------------------------------
+// Mapped libraries / shared objects
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct MappedLibrary {
+    pub name: String,           // library id (path)
+    pub target_name: String,    // target-visible name
+    pub base_addr: Option<u64>, // base load address from ranges
+    pub symbols_loaded: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -214,8 +271,17 @@ pub struct GdbSnapshot {
     // Disassembly
     pub disasm: Vec<DisasmInstruction>,
 
+    // Cross-references
+    pub xrefs: Vec<XrefEntry>,
+
+    // Type overlay
+    pub type_overlay: Option<TypeOverlay>,
+
     // Watch expressions
     pub watch_expressions: Vec<WatchExpression>,
+
+    // Mapped libraries / shared objects
+    pub mapped_libs: Vec<MappedLibrary>,
 
     // Source viewer
     pub source: Option<SourceFile>,
@@ -228,6 +294,12 @@ pub struct GdbSnapshot {
     // Status bar
     pub status_message: Option<String>,
     pub target_executable: Option<String>,
+
+    // Recording
+    pub recording_count: usize,
+
+    // Debug info availability (false for stripped / no-symbols binaries)
+    pub has_debug_info: bool,
 }
 
 impl GdbSnapshot {
@@ -247,13 +319,18 @@ impl GdbSnapshot {
             memory: None,
             memory_address: 0,
             disasm: Vec::new(),
+            xrefs: Vec::new(),
+            type_overlay: None,
             watch_expressions: Vec::new(),
+            mapped_libs: Vec::new(),
             source: None,
             source_line: None,
             source_loading: false,
             output: Vec::new(),
             status_message: None,
             target_executable: None,
+            recording_count: 0,
+            has_debug_info: false,
         }
     }
 

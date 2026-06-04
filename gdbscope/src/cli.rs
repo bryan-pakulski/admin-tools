@@ -43,6 +43,18 @@ pub struct Args {
     /// Enable debug tracing to stderr (disables TUI)
     #[arg(long)]
     pub debug: bool,
+
+    /// Maximum number of recorded debug states to keep (0 = disable recording)
+    #[arg(long, default_value_t = 1000)]
+    pub record_max: usize,
+
+    /// Maximum age of recorded states in seconds (0 = unlimited)
+    #[arg(long, default_value_t = 300)]
+    pub record_secs: u64,
+
+    /// Max steps to capture when trace-continuing (F6) to a breakpoint
+    #[arg(long, default_value_t = 500)]
+    pub trace_depth: usize,
 }
 
 #[cfg(test)]

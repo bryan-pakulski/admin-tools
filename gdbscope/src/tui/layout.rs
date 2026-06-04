@@ -91,6 +91,7 @@ pub struct PanelLayout {
     pub status_bar: Rect,
     pub main_area: Rect,
     pub output_area: Option<Rect>,
+    pub timeline_area: Option<Rect>,
     pub footer: Rect,
     pub left_panels: Vec<(Panel, Rect)>,
     pub right_panels: Vec<(Panel, Rect)>,
@@ -110,10 +111,17 @@ pub struct PanelLayout {
 /// +-----------------------------------------+
 /// | output panel (if visible, ~25% or 6 min) |
 /// +-----------------------------------------+
+/// | timeline bar (if recording, 4 lines)     |
+/// +-----------------------------------------+
 /// | footer (1 line)                          |
 /// +-----------------------------------------+
 /// ```
 pub fn compute(area: Rect, visible: &[Panel]) -> PanelLayout {
+    compute_with_timeline(area, visible, false)
+}
+
+/// Like [`compute`] but optionally reserves space for the timeline bar.
+pub fn compute_with_timeline(area: Rect, visible: &[Panel], show_timeline: bool) -> PanelLayout {
     // Separate panels into categories
     let left: Vec<Panel> = visible
         .iter()
@@ -127,18 +135,27 @@ pub fn compute(area: Rect, visible: &[Panel]) -> PanelLayout {
         .collect();
     let has_output = visible.contains(&Panel::Output);
 
-    // Vertical split: status_bar | main_area | output_area? | footer
+    // Timeline height: 4 lines for border + timeline bar + diff line + border
+    let timeline_h: u16 = if show_timeline { 4 } else { 0 };
+
+    // Fixed rows: status(1) + footer(1) + timeline
+    let fixed_rows = 2 + timeline_h;
+
+    // Vertical split: status_bar | main_area | output_area? | timeline? | footer
     let mut vert_constraints = vec![Constraint::Length(1)]; // status bar
 
     if has_output {
         // Main gets remaining, output gets ~25% (min 6 lines)
-        let total_inner = area.height.saturating_sub(2); // minus status + footer
+        let total_inner = area.height.saturating_sub(fixed_rows);
         let output_h = (total_inner / 4).max(6).min(total_inner.saturating_sub(6));
         let main_h = total_inner.saturating_sub(output_h);
         vert_constraints.push(Constraint::Length(main_h));
         vert_constraints.push(Constraint::Length(output_h));
     } else {
         vert_constraints.push(Constraint::Fill(1));
+    }
+    if show_timeline {
+        vert_constraints.push(Constraint::Length(timeline_h));
     }
     vert_constraints.push(Constraint::Length(1)); // footer
 
@@ -149,11 +166,24 @@ pub fn compute(area: Rect, visible: &[Panel]) -> PanelLayout {
 
     let status_bar = vert_chunks[0];
     let main_area = vert_chunks[1];
+
+    // The chunk indices shift depending on which optional sections are present
+    let mut next_idx = 2;
     let output_area = if has_output {
-        Some(vert_chunks[2])
+        let r = Some(vert_chunks[next_idx]);
+        next_idx += 1;
+        r
     } else {
         None
     };
+    let timeline_area = if show_timeline {
+        let r = Some(vert_chunks[next_idx]);
+        next_idx += 1;
+        r
+    } else {
+        None
+    };
+    let _ = next_idx; // suppress unused warning
     let footer = vert_chunks[vert_chunks.len() - 1];
 
     // Horizontal split of main_area into left and right
@@ -181,6 +211,7 @@ pub fn compute(area: Rect, visible: &[Panel]) -> PanelLayout {
         status_bar,
         main_area,
         output_area,
+        timeline_area,
         footer,
         left_panels: left_panels_out,
         right_panels: right_panels_out,
@@ -209,5 +240,149 @@ fn split_panels_vertically(
 
     for (panel, &rect) in panels.iter().zip(chunks.iter()) {
         out.push((*panel, rect));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::layout::Rect;
+
+    fn test_area() -> Rect {
+        Rect::new(0, 0, 120, 40)
+    }
+
+    #[test]
+    fn panel_all_returns_10_panels() {
+        assert_eq!(Panel::all().len(), 10);
+    }
+
+    #[test]
+    fn panel_default_visible_correct() {
+        assert!(Panel::Source.default_visible());
+        assert!(Panel::Stack.default_visible());
+        assert!(Panel::Locals.default_visible());
+        assert!(Panel::Breakpoints.default_visible());
+        assert!(Panel::Output.default_visible());
+
+        assert!(!Panel::Threads.default_visible());
+        assert!(!Panel::Registers.default_visible());
+        assert!(!Panel::Memory.default_visible());
+        assert!(!Panel::Disasm.default_visible());
+        assert!(!Panel::Watch.default_visible());
+    }
+
+    #[test]
+    fn panel_index_consistent_with_all() {
+        for (i, panel) in Panel::all().iter().enumerate() {
+            assert_eq!(panel.index(), i, "panel {:?} index mismatch", panel);
+        }
+    }
+
+    #[test]
+    fn compute_with_default_panels_produces_nonzero_rects() {
+        let visible: Vec<Panel> = Panel::all()
+            .iter()
+            .copied()
+            .filter(|p| p.default_visible())
+            .collect();
+        let layout = compute(test_area(), &visible);
+
+        assert!(layout.status_bar.width > 0);
+        assert!(layout.status_bar.height > 0);
+        assert!(layout.footer.width > 0);
+        assert!(layout.footer.height > 0);
+        assert!(layout.main_area.width > 0);
+        assert!(layout.main_area.height > 0);
+
+        // Output should be present since it is default visible
+        assert!(layout.output_area.is_some());
+        let output = layout.output_area.unwrap();
+        assert!(output.width > 0);
+        assert!(output.height > 0);
+
+        // Left panels should include Source
+        assert!(!layout.left_panels.is_empty());
+        for (panel, rect) in &layout.left_panels {
+            assert!(rect.width > 0, "left panel {:?} has zero width", panel);
+            assert!(rect.height > 0, "left panel {:?} has zero height", panel);
+        }
+
+        // Right panels should include Stack, Locals, Breakpoints
+        assert!(!layout.right_panels.is_empty());
+        for (panel, rect) in &layout.right_panels {
+            assert!(rect.width > 0, "right panel {:?} has zero width", panel);
+            assert!(rect.height > 0, "right panel {:?} has zero height", panel);
+        }
+    }
+
+    #[test]
+    fn compute_with_timeline_allocates_timeline_area() {
+        let visible: Vec<Panel> = Panel::all()
+            .iter()
+            .copied()
+            .filter(|p| p.default_visible())
+            .collect();
+
+        let layout_no_tl = compute_with_timeline(test_area(), &visible, false);
+        assert!(layout_no_tl.timeline_area.is_none());
+
+        let layout_tl = compute_with_timeline(test_area(), &visible, true);
+        assert!(layout_tl.timeline_area.is_some());
+        let tl = layout_tl.timeline_area.unwrap();
+        assert!(tl.width > 0);
+        assert_eq!(tl.height, 4); // timeline is 4 lines
+    }
+
+    #[test]
+    fn horizontal_split_separates_left_and_right() {
+        let visible = vec![Panel::Source, Panel::Stack, Panel::Locals];
+        let layout = compute(test_area(), &visible);
+
+        assert!(!layout.left_panels.is_empty());
+        assert!(!layout.right_panels.is_empty());
+
+        let left_x = layout.left_panels[0].1.x;
+        let right_x = layout.right_panels[0].1.x;
+        assert!(
+            right_x > left_x,
+            "right panels (x={}) should have greater x than left panels (x={})",
+            right_x,
+            left_x
+        );
+    }
+
+    #[test]
+    fn only_right_panels_get_full_width() {
+        let visible = vec![Panel::Stack, Panel::Locals];
+        let layout = compute(test_area(), &visible);
+
+        assert!(layout.left_panels.is_empty());
+        assert!(!layout.right_panels.is_empty());
+        // Right panels should use the full main_area width
+        for (_panel, rect) in &layout.right_panels {
+            assert_eq!(rect.width, layout.main_area.width);
+        }
+    }
+
+    #[test]
+    fn no_output_panel_means_no_output_area() {
+        let visible = vec![Panel::Source, Panel::Stack];
+        let layout = compute(test_area(), &visible);
+        assert!(layout.output_area.is_none());
+    }
+
+    #[test]
+    fn panel_labels_are_nonempty() {
+        for panel in Panel::all() {
+            assert!(!panel.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn panel_key_hints_are_nonempty() {
+        for panel in Panel::all() {
+            assert!(!panel.key_hint().is_empty());
+        }
     }
 }

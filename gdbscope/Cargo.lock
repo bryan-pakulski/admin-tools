@@ -327,6 +327,7 @@ dependencies = [
  "clap",
  "crossterm",
  "indexmap",
+ "libc",
  "ratatui",
  "syntect",
  "thiserror 1.0.69",

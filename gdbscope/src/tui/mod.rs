@@ -3,8 +3,9 @@ pub mod layout;
 pub mod panels;
 pub mod widgets;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -19,10 +20,15 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 use crate::gdb::controller::GdbCommand;
-use crate::state::{GdbSnapshot, SharedState, TargetState};
+use crate::recording::Recording;
+use crate::state::{GdbSnapshot, SharedState, StopReason, TargetState};
 
 use input::{Action, InputMode};
 use layout::Panel;
+
+/// Shared handle to the recording buffer, used by the TUI to read playback
+/// state and by the controller to write new captures.
+pub type SharedRecording = Arc<std::sync::Mutex<Recording>>;
 
 // ---------------------------------------------------------------------------
 // Memory type interpretation
@@ -81,6 +87,48 @@ impl MemCast {
 }
 
 // ---------------------------------------------------------------------------
+// Recording timeline summary types (populated from Recording each frame)
+// ---------------------------------------------------------------------------
+
+/// Lightweight entry for rendering the timeline bar.
+#[derive(Debug, Clone)]
+pub struct RecTimelineEntry {
+    pub seq: u64,
+    pub stop_label: String,    // "step", "bp#1", "signal SIGSEGV", etc.
+    pub source_loc: Option<String>, // "main.c:42"
+    pub is_anchor: bool,       // breakpoint/watchpoint hit
+}
+
+/// Diff summary at the current playback position.
+#[derive(Debug, Clone, Default)]
+pub struct RecDiffSummary {
+    pub vars_changed: Vec<(String, String, String)>,  // (name, old, new)
+    pub vars_added: Vec<String>,
+    pub vars_removed: Vec<String>,
+    pub regs_changed: usize,
+    pub mem_changed: usize,
+    pub watches_changed: Vec<(String, String, String)>, // (expr, old, new)
+    pub source_from: Option<String>,  // "file.c:10"
+    pub source_to: Option<String>,    // "file.c:15"
+    pub thread_changed: bool,
+    pub stop_label: String,
+}
+
+// ---------------------------------------------------------------------------
+// Execution flow data (computed from recording for playback display)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+pub struct ExecFlowData {
+    /// source_path -> line_number -> hit count
+    pub line_hits: HashMap<String, HashMap<u32, u32>>,
+    /// disasm address -> hit count
+    pub addr_hits: HashMap<u64, u32>,
+    /// Total number of recorded states analyzed
+    pub total_steps: usize,
+}
+
+// ---------------------------------------------------------------------------
 // View state
 // ---------------------------------------------------------------------------
 
@@ -106,6 +154,7 @@ pub struct ViewState {
     pub mem_edit_nibble: Option<u8>,  // first nibble of a two-nibble hex edit
     pub mem_cast: MemCast,       // current type interpretation for selection
     pub disasm_scroll: usize,
+    pub disasm_cursor: usize,    // index into snap.disasm for cursor navigation
     pub watch_selected: usize,
     pub output_scroll: usize,
     pub output_follow: bool,
@@ -120,6 +169,9 @@ pub struct ViewState {
     pub history_index: usize,
     pub last_command: Option<String>,
 
+    // Auto-layout for no-symbols / RE mode
+    pub layout_auto_switched: bool,
+
     // Overlays
     pub help_open: bool,
     pub help_scroll: u16,
@@ -132,6 +184,22 @@ pub struct ViewState {
 
     // Animation frame counter (increments each tick)
     pub tick_count: u64,
+
+    // Timeline / playback
+    pub playback_mode: bool,       // true = viewing a past recorded state
+    pub playback_index: usize,     // index into recording.states
+    pub timeline_scroll: usize,    // horizontal scroll for the timeline bar
+    pub rec_count: usize,          // total recorded states
+    pub rec_enabled: bool,         // recording on/off
+    pub rec_entries: Vec<RecTimelineEntry>,   // lightweight timeline for rendering
+    pub rec_diff: Option<RecDiffSummary>,     // diff at current playback position
+    pub rec_playback_source_loc: Option<String>, // source location at playback index
+    pub rec_playback_snap: Option<GdbSnapshot>,  // reconstructed snapshot for playback panels
+    pub playback_source_cache: std::collections::HashMap<String, crate::state::SourceFile>,
+
+    // Execution flow analysis
+    pub exec_flow: Option<ExecFlowData>,
+    pub exec_flow_computed_at: usize,
 }
 
 impl Default for ViewState {
@@ -162,6 +230,7 @@ impl Default for ViewState {
             mem_edit_nibble: None,
             mem_cast: MemCast::Hex,
             disasm_scroll: 0,
+            disasm_cursor: 0,
             watch_selected: 0,
             output_scroll: 0,
             output_follow: true,
@@ -174,6 +243,8 @@ impl Default for ViewState {
             history_index: 0,
             last_command: None,
 
+            layout_auto_switched: false,
+
             help_open: false,
             help_scroll: 0,
             quit_confirm: false,
@@ -183,6 +254,20 @@ impl Default for ViewState {
             search_current: 0,
 
             tick_count: 0,
+
+            playback_mode: false,
+            playback_index: 0,
+            timeline_scroll: 0,
+            rec_count: 0,
+            rec_enabled: true,
+            rec_entries: Vec::new(),
+            rec_diff: None,
+            rec_playback_source_loc: None,
+            rec_playback_snap: None,
+            playback_source_cache: std::collections::HashMap::new(),
+
+            exec_flow: None,
+            exec_flow_computed_at: 0,
         }
     }
 }
@@ -353,7 +438,7 @@ impl ViewState {
             Panel::Registers => &mut self.registers_scroll,
             Panel::Output => &mut self.output_scroll,
             Panel::Memory => &mut self.memory_scroll,
-            Panel::Disasm => &mut self.disasm_scroll,
+            Panel::Disasm => &mut self.disasm_cursor,
         }
     }
 }
@@ -369,6 +454,7 @@ pub async fn run(
     state: SharedState,
     cmd_tx: mpsc::Sender<GdbCommand>,
     redraw_hz: u32,
+    recording: SharedRecording,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -378,7 +464,7 @@ pub async fn run(
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let result = event_loop(&mut terminal, state, cmd_tx, redraw_hz).await;
+    let result = event_loop(&mut terminal, state, cmd_tx, redraw_hz, recording).await;
 
     // Cleanup -- always restore the terminal
     disable_raw_mode()?;
@@ -397,6 +483,7 @@ async fn event_loop(
     state: SharedState,
     cmd_tx: mpsc::Sender<GdbCommand>,
     redraw_hz: u32,
+    recording: SharedRecording,
 ) -> Result<()> {
     let mut view = ViewState::default();
     let tick_rate = Duration::from_millis(1000 / redraw_hz as u64);
@@ -433,31 +520,397 @@ async fn event_loop(
                     }
                 }
 
+                // Help overlay intercepts all keys when open
+                if view.help_open {
+                    use crossterm::event::KeyCode;
+                    match key.code {
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            view.help_scroll = view.help_scroll.saturating_add(1);
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            view.help_scroll = view.help_scroll.saturating_sub(1);
+                        }
+                        KeyCode::PageDown => {
+                            view.help_scroll = view.help_scroll.saturating_add(20);
+                        }
+                        KeyCode::PageUp => {
+                            view.help_scroll = view.help_scroll.saturating_sub(20);
+                        }
+                        KeyCode::Char('g') | KeyCode::Home => {
+                            view.help_scroll = 0;
+                        }
+                        KeyCode::Char('G') | KeyCode::End => {
+                            view.help_scroll = 200; // past the end, clamps in render
+                        }
+                        KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Esc | KeyCode::F(1) => {
+                            view.help_open = false;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 let action = match view.input_mode {
                     InputMode::Normal => input::map_normal(key, view.quit_confirm),
                     _ => input::map_input(key),
                 };
 
-                if dispatch_action(action, &mut view, &state, &cmd_tx).await {
+                if dispatch_action(action, &mut view, &state, &cmd_tx, &recording).await {
                     return Ok(());
                 }
             }
         }
 
-        let snap = state.load();
+        let live_snap = state.load();
 
-        // Auto-sync cursor to execution line when GDB stops at a new location
-        if view.source_follow_exec {
-            if let Some(line) = snap.source_line {
-                if prev_source_line != Some(line) {
+        // Sync recording timeline data into ViewState for rendering
+        sync_recording_view(&mut view, &recording);
+
+        // Decide which snapshot to render: playback or live
+        let render_snap = if view.playback_mode {
+            if let Some(ref mut pb) = view.rec_playback_snap {
+                // Try to fill in the source file for the playback state
+                if pb.source.is_none() {
+                    // Find the source path: try current frame level, then walk
+                    // up the stack to find ANY frame with source.
+                    let pb_path = pb.stack.iter()
+                        .find(|f| f.level == pb.current_frame_level && f.fullname.is_some())
+                        .or_else(|| pb.stack.iter().find(|f| f.fullname.is_some()))
+                        .and_then(|f| f.fullname.clone());
+                    if let (Some(ref live_src), Some(ref wanted)) = (&live_snap.source, &pb_path) {
+                        if live_src.path == *wanted {
+                            pb.source = Some(live_src.clone());
+                        }
+                    }
+                    // Otherwise, check playback cache or load from disk
+                    if pb.source.is_none() {
+                        if let Some(ref path) = pb_path {
+                            if let Some(cached) = view.playback_source_cache.get(path) {
+                                pb.source = Some(cached.clone());
+                            } else if let Ok(contents) = std::fs::read_to_string(path) {
+                                let lines: Vec<String> = contents.lines().map(String::from).collect();
+                                let highlighted = crate::highlight::highlight_lines(path, &lines);
+                                let src = crate::state::SourceFile {
+                                    path: path.clone(),
+                                    lines,
+                                    highlighted,
+                                };
+                                view.playback_source_cache.insert(path.clone(), src.clone());
+                                pb.source = Some(src);
+                            }
+                        }
+                    }
+                }
+                pb.breakpoints = live_snap.breakpoints.clone();
+                pb.output = live_snap.output.clone();
+                pb.target_executable = live_snap.target_executable.clone();
+                pb.recording_count = live_snap.recording_count;
+
+                // Update source cursor: use recorded source_line, or fall back
+                // to the line from the frame that has source.
+                let playback_line = pb.source_line.or_else(|| {
+                    pb.stack.iter()
+                        .find(|f| f.level == pb.current_frame_level && f.line.is_some())
+                        .or_else(|| pb.stack.iter().find(|f| f.line.is_some()))
+                        .and_then(|f| f.line)
+                });
+                if let Some(line) = playback_line {
+                    pb.source_line = Some(line);
                     view.source_cursor = line as usize;
                 }
             }
+            view.rec_playback_snap.as_ref().unwrap_or(&live_snap)
+        } else {
+            // Auto-sync cursor to execution line when GDB stops at a new location
+            if view.source_follow_exec {
+                if let Some(line) = live_snap.source_line {
+                    if prev_source_line != Some(line) {
+                        view.source_cursor = line as usize;
+                    }
+                }
+            }
+            prev_source_line = live_snap.source_line;
+            &live_snap
+        };
+
+        // Auto-switch to RE layout when no debug symbols detected
+        if !view.layout_auto_switched {
+            let no_debug = !render_snap.has_debug_info
+                && render_snap.source.is_none()
+                && render_snap.target_state == TargetState::Stopped
+                && !render_snap.stack.is_empty();
+            if no_debug {
+                view.layout_auto_switched = true;
+                // Switch to RE layout: Disasm + Registers + Memory + Stack + Breakpoints + Output
+                view.panels_visible.clear();
+                view.panels_visible.insert(Panel::Disasm);
+                view.panels_visible.insert(Panel::Registers);
+                view.panels_visible.insert(Panel::Memory);
+                view.panels_visible.insert(Panel::Stack);
+                view.panels_visible.insert(Panel::Breakpoints);
+                view.panels_visible.insert(Panel::Output);
+                view.focused_panel = Panel::Disasm;
+            }
         }
-        prev_source_line = snap.source_line;
 
         view.tick_count = view.tick_count.wrapping_add(1);
-        terminal.draw(|f| draw(f, &snap, &view))?;
+        terminal.draw(|f| draw(f, render_snap, &view))?;
+    }
+}
+
+/// Read the Recording once per frame and populate ViewState fields for the
+/// timeline panel to render from.  The lock is held only for the duration of
+/// this function (microseconds).
+fn sync_recording_view(view: &mut ViewState, recording: &SharedRecording) {
+    // Acquire the lock BRIEFLY — just read the count and any new entries.
+    // Avoid holding the lock while doing expensive work, since the controller
+    // also needs it to capture states during tracing.
+    let (rec_len, rec_enabled, new_entries) = {
+        let rec = match recording.lock() {
+            Ok(r) => r,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let len = rec.len();
+        let enabled = rec.enabled;
+
+        // Incrementally append new entries (don't rebuild the whole list)
+        let mut new = Vec::new();
+        if len > view.rec_entries.len() {
+            for i in view.rec_entries.len()..len {
+                if let Some(state) = rec.get(i) {
+                    let stop_label = stop_reason_label(&state.stop_reason);
+                    let source_loc = match (&state.source_path, state.source_line) {
+                        (Some(path), Some(line)) => {
+                            let short = path.rsplit('/').next().unwrap_or(path);
+                            Some(format!("{}:{}", short, line))
+                        }
+                        _ => None,
+                    };
+                    new.push(RecTimelineEntry {
+                        seq: state.seq,
+                        stop_label,
+                        source_loc,
+                        is_anchor: state.is_anchor,
+                    });
+                }
+            }
+        } else if len < view.rec_entries.len() {
+            // Recording was cleared or entries expired
+            new.clear();
+        }
+
+        (len, enabled, new)
+    };
+    // Lock is released here.
+
+    view.rec_count = rec_len;
+    view.rec_enabled = rec_enabled;
+
+    if rec_len < view.rec_entries.len() {
+        // Recording shrunk (clear + rebuild would need the lock again;
+        // just truncate for now — full rebuild on next frame if needed)
+        view.rec_entries.clear();
+        view.exec_flow = None;
+        view.exec_flow_computed_at = 0;
+    }
+    view.rec_entries.extend(new_entries);
+
+    // Build execution flow data — but only when NOT actively tracing,
+    // to avoid expensive full scans that block the controller.
+    let is_tracing = {
+        let snap_state = view.rec_count > view.exec_flow_computed_at;
+        snap_state && rec_enabled
+    };
+    if rec_len > 0 && rec_len != view.exec_flow_computed_at && !is_tracing {
+        // Full scan — only runs when tracing has stopped and count is stable
+        let rec = match recording.lock() {
+            Ok(r) => r,
+            Err(_) => return, // skip if we can't get the lock
+        };
+
+        let mut line_hits: std::collections::HashMap<String, std::collections::HashMap<u32, u32>> = std::collections::HashMap::new();
+        let mut addr_hits: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+
+        for i in 0..rec.len() {
+            if let Some(state) = rec.get(i) {
+                if let (Some(path), Some(line)) = (&state.source_path, state.source_line) {
+                    *line_hits
+                        .entry(path.clone())
+                        .or_default()
+                        .entry(line)
+                        .or_default() += 1;
+                }
+                if let Some(frame) = state.stack.first() {
+                    *addr_hits.entry(frame.addr).or_default() += 1;
+                }
+            }
+        }
+
+        drop(rec);
+
+        view.exec_flow = Some(ExecFlowData {
+            line_hits,
+            addr_hits,
+            total_steps: rec_len,
+        });
+        view.exec_flow_computed_at = rec_len;
+    } else if rec_len == 0 {
+        view.exec_flow = None;
+        view.exec_flow_computed_at = 0;
+    }
+
+    // Playback state (only needed when in playback mode, brief lock)
+    if view.playback_mode {
+        if let Ok(rec) = recording.lock() {
+            if !rec.is_empty() {
+                view.playback_index = view.playback_index.min(rec.len().saturating_sub(1));
+            }
+
+            if let Some(diff) = rec.get_diff(view.playback_index) {
+                let state = rec.get(view.playback_index);
+                let prev_state = if view.playback_index > 0 {
+                    rec.get(view.playback_index - 1)
+                } else {
+                    None
+                };
+
+                let source_from = prev_state.and_then(|s| {
+                    match (&s.source_path, s.source_line) {
+                        (Some(p), Some(l)) => {
+                            let short = p.rsplit('/').next().unwrap_or(p);
+                            Some(format!("{}:{}", short, l))
+                        }
+                        _ => None,
+                    }
+                });
+                let source_to = state.and_then(|s| {
+                    match (&s.source_path, s.source_line) {
+                        (Some(p), Some(l)) => {
+                            let short = p.rsplit('/').next().unwrap_or(p);
+                            Some(format!("{}:{}", short, l))
+                        }
+                        _ => None,
+                    }
+                });
+
+                view.rec_diff = Some(RecDiffSummary {
+                    vars_changed: diff
+                        .locals_changed
+                        .iter()
+                        .map(|c| (c.name.clone(), c.old_value.clone(), c.new_value.clone()))
+                        .collect(),
+                    vars_added: diff.locals_added.clone(),
+                    vars_removed: diff.locals_removed.clone(),
+                    regs_changed: diff.registers_changed.len(),
+                    mem_changed: diff.memory_changed.len(),
+                    watches_changed: diff
+                        .watches_changed
+                        .iter()
+                        .map(|c| {
+                            (
+                                c.expression.clone(),
+                                c.old_value.clone(),
+                                c.new_value.clone(),
+                            )
+                        })
+                        .collect(),
+                    source_from,
+                    source_to,
+                    thread_changed: diff.thread_changed,
+                    stop_label: state
+                        .map(|s| stop_reason_label(&s.stop_reason))
+                        .unwrap_or_default(),
+                });
+            } else {
+                let state = rec.get(view.playback_index);
+                view.rec_diff = Some(RecDiffSummary {
+                    stop_label: state
+                        .map(|s| stop_reason_label(&s.stop_reason))
+                        .unwrap_or_default(),
+                    ..Default::default()
+                });
+            }
+
+            view.rec_playback_source_loc = rec.get(view.playback_index).and_then(|s| {
+                match (&s.source_path, s.source_line) {
+                    (Some(p), Some(l)) => {
+                        let short = p.rsplit('/').next().unwrap_or(p);
+                        Some(format!("{}:{}", short, l))
+                    }
+                    _ => None,
+                }
+            });
+            if let Some(rs) = rec.get(view.playback_index) {
+                view.rec_playback_snap = Some(build_playback_snapshot(rs));
+            }
+        }
+    } else {
+        view.rec_diff = None;
+        view.rec_playback_source_loc = None;
+        view.rec_playback_snap = None;
+    }
+}
+
+/// Reconstruct a GdbSnapshot from a RecordedState for playback rendering.
+fn build_playback_snapshot(rs: &crate::recording::RecordedState) -> GdbSnapshot {
+    use crate::state::*;
+    GdbSnapshot {
+        target_state: TargetState::Stopped,
+        stop_reason: rs.stop_reason.clone(),
+        threads: Vec::new(),
+        current_thread_id: rs.thread_id,
+        stack: rs.stack.clone(),
+        current_frame_level: rs.frame_level,
+        locals: rs.locals.clone(),
+        breakpoints: Vec::new(),
+        registers: rs.registers.clone(),
+        register_names: Vec::new(),
+        memory: rs.memory.clone(),
+        memory_address: rs.memory.as_ref().map_or(0, |m| m.address),
+        disasm: rs.disasm.clone(),
+        xrefs: Vec::new(),
+        type_overlay: None,
+        watch_expressions: rs
+            .watch_values
+            .iter()
+            .map(|(expr, val)| WatchExpression {
+                id: 0,
+                expression: expr.clone(),
+                value: val.clone(),
+                type_name: String::new(),
+                error: None,
+            })
+            .collect(),
+        mapped_libs: Vec::new(),
+        source: None, // filled in below from live snapshot
+        source_line: rs.source_line,
+        source_loading: false,
+        output: Vec::new(),
+        status_message: None,
+        target_executable: None,
+        recording_count: 0,
+        has_debug_info: false,
+    }
+}
+
+/// Convert a StopReason to a short label for the timeline.
+fn stop_reason_label(reason: &Option<StopReason>) -> String {
+    match reason {
+        Some(StopReason::StepFinished) => "step".to_string(),
+        Some(StopReason::BreakpointHit { number }) => format!("bp#{}", number),
+        Some(StopReason::Watchpoint { number }) => format!("wp#{}", number),
+        Some(StopReason::SignalReceived { name, .. }) => format!("sig:{}", name),
+        Some(StopReason::FunctionFinished) => "return".to_string(),
+        Some(StopReason::ExitedNormally { code }) => format!("exit({})", code),
+        Some(StopReason::Unknown(s)) => {
+            if s.len() > 12 {
+                format!("{}...", &s[..12])
+            } else {
+                s.clone()
+            }
+        }
+        None => "stop".to_string(),
     }
 }
 
@@ -471,6 +924,7 @@ async fn dispatch_action(
     view: &mut ViewState,
     state: &SharedState,
     cmd_tx: &mpsc::Sender<GdbCommand>,
+    recording: &SharedRecording,
 ) -> bool {
     match action {
         Action::None => {}
@@ -511,19 +965,37 @@ async fn dispatch_action(
                 _ => return false,
             };
             view.source_follow_exec = true;
+            view.playback_mode = false;
             let _ = cmd_tx.send(cmd).await;
         }
+        Action::TraceContinue => {
+            let snap = state.load();
+            if matches!(snap.target_state, TargetState::Stopped) {
+                view.source_follow_exec = true;
+                view.playback_mode = false;
+                let _ = cmd_tx.send(GdbCommand::TraceContinue).await;
+            }
+        }
         Action::StepInto => {
-            view.source_follow_exec = true;
-            let _ = cmd_tx.send(GdbCommand::StepInto).await;
+            let snap = state.load();
+            if matches!(snap.target_state, TargetState::Stopped) {
+                view.source_follow_exec = true;
+                let _ = cmd_tx.send(GdbCommand::StepInto).await;
+            }
         }
         Action::StepOver => {
-            view.source_follow_exec = true;
-            let _ = cmd_tx.send(GdbCommand::StepOver).await;
+            let snap = state.load();
+            if matches!(snap.target_state, TargetState::Stopped) {
+                view.source_follow_exec = true;
+                let _ = cmd_tx.send(GdbCommand::StepOver).await;
+            }
         }
         Action::StepOut => {
-            view.source_follow_exec = true;
-            let _ = cmd_tx.send(GdbCommand::StepOut).await;
+            let snap = state.load();
+            if matches!(snap.target_state, TargetState::Stopped) {
+                view.source_follow_exec = true;
+                let _ = cmd_tx.send(GdbCommand::StepOut).await;
+            }
         }
         Action::Interrupt => {
             let _ = cmd_tx.send(GdbCommand::Interrupt).await;
@@ -644,6 +1116,32 @@ async fn dispatch_action(
                         view.source_follow_exec = true;
                     }
                 }
+                Panel::Disasm => {
+                    // Set breakpoint at cursor address
+                    if let Some(inst) = snap.disasm.get(view.disasm_cursor) {
+                        let location = format!("*0x{:x}", inst.address);
+                        let _ = cmd_tx
+                            .send(GdbCommand::SetBreakpoint(location))
+                            .await;
+                    }
+                }
+                Panel::Memory => {
+                    // Follow pointer at cursor position
+                    if let Some(ref mem) = snap.memory {
+                        let cursor = view.mem_cursor;
+                        if cursor + 8 <= mem.bytes.len() {
+                            let addr = u64::from_le_bytes(
+                                mem.bytes[cursor..cursor + 8].try_into().unwrap()
+                            );
+                            if addr != 0 {
+                                let _ = cmd_tx
+                                    .send(GdbCommand::ReadMemory { addr, count: 256 })
+                                    .await;
+                                view.mem_cursor = 0;
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -675,7 +1173,25 @@ async fn dispatch_action(
         // ---- Breakpoints ----
         Action::ToggleBreakAtLine => {
             let snap = state.load();
-            if let Some(ref src) = snap.source {
+            if view.focused_panel == Panel::Disasm {
+                // Toggle breakpoint at disasm cursor address
+                if let Some(inst) = snap.disasm.get(view.disasm_cursor) {
+                    let addr = inst.address;
+                    let existing = snap.breakpoints.iter().find(|bp| {
+                        bp.address == Some(addr)
+                    });
+                    if let Some(bp) = existing {
+                        let _ = cmd_tx
+                            .send(GdbCommand::DeleteBreakpoint(bp.number))
+                            .await;
+                    } else {
+                        let location = format!("*0x{:x}", addr);
+                        let _ = cmd_tx
+                            .send(GdbCommand::SetBreakpoint(location))
+                            .await;
+                    }
+                }
+            } else if let Some(ref src) = snap.source {
                 let line = view.source_cursor;
                 if line >= 1 && line <= src.lines.len() {
                     let existing = snap.breakpoints.iter().find(|bp| {
@@ -700,6 +1216,31 @@ async fn dispatch_action(
         }
         Action::PromptBreakpoint => {
             view.start_input(InputMode::Breakpoint);
+        }
+        Action::PromptBreakpointCond => {
+            view.start_input(InputMode::BreakpointCond);
+        }
+        Action::PromptBreakCondEdit => {
+            let snap = state.load();
+            if let Some(bp) = snap.breakpoints.get(view.breakpoints_selected) {
+                let prefill = bp.condition.clone().unwrap_or_default();
+                // Store the BP number in the input buffer as "number condition"
+                // We parse it back out on submit.
+                let tagged = format!("{} {}", bp.number, prefill);
+                view.start_input_with(InputMode::BreakCondEdit, tagged);
+            }
+        }
+        Action::PromptWatchpoint => {
+            view.start_input(InputMode::Watchpoint);
+        }
+        Action::PromptRegisterEdit => {
+            let snap = state.load();
+            if view.focused_panel == Panel::Registers {
+                if let Some(reg) = snap.registers.get(view.registers_scroll) {
+                    let prefill = format!("{} {}", reg.name, reg.value);
+                    view.start_input_with(InputMode::RegisterEdit, prefill);
+                }
+            }
         }
         Action::DeleteBreakpoint => {
             let snap = state.load();
@@ -815,6 +1356,78 @@ async fn dispatch_action(
                 InputMode::Eval => {
                     let _ = cmd_tx.send(GdbCommand::EvaluateExpression(buf)).await;
                 }
+                InputMode::BreakpointCond => {
+                    // Parse: "location if condition" or "location"
+                    if let Some(idx) = buf.find(" if ") {
+                        let location = buf[..idx].trim().to_string();
+                        let condition = buf[idx + 4..].trim().to_string();
+                        if !location.is_empty() && !condition.is_empty() {
+                            let _ = cmd_tx
+                                .send(GdbCommand::SetBreakpointCond { location, condition })
+                                .await;
+                        } else if !location.is_empty() {
+                            let _ = cmd_tx
+                                .send(GdbCommand::SetBreakpoint(location))
+                                .await;
+                        }
+                    } else {
+                        // No condition — set as normal breakpoint
+                        let _ = cmd_tx.send(GdbCommand::SetBreakpoint(buf)).await;
+                    }
+                }
+                InputMode::BreakCondEdit => {
+                    // Buffer is "number condition_text"
+                    // The first token is the breakpoint number; the rest is the condition.
+                    let parts: Vec<&str> = buf.splitn(2, ' ').collect();
+                    if let Some(num_str) = parts.first() {
+                        if let Ok(number) = num_str.parse::<u32>() {
+                            let condition = parts
+                                .get(1)
+                                .map(|s| s.trim().to_string())
+                                .unwrap_or_default();
+                            if !condition.is_empty() {
+                                let _ = cmd_tx
+                                    .send(GdbCommand::BreakCondition { number, condition })
+                                    .await;
+                            }
+                        }
+                    }
+                }
+                InputMode::Watchpoint => {
+                    // Parse: "expr [r|w|rw|a]"
+                    // Default is write. Trailing modifier selects kind.
+                    use crate::gdb::mi_command::WatchKind;
+                    let trimmed = buf.trim();
+                    let (expr, kind) = if let Some(stripped) = trimmed.strip_suffix(" rw") {
+                        (stripped.to_string(), WatchKind::Access)
+                    } else if let Some(stripped) = trimmed.strip_suffix(" a") {
+                        (stripped.to_string(), WatchKind::Access)
+                    } else if let Some(stripped) = trimmed.strip_suffix(" r") {
+                        (stripped.to_string(), WatchKind::Read)
+                    } else if let Some(stripped) = trimmed.strip_suffix(" w") {
+                        (stripped.to_string(), WatchKind::Write)
+                    } else {
+                        (trimmed.to_string(), WatchKind::Write)
+                    };
+                    if !expr.is_empty() {
+                        let _ = cmd_tx
+                            .send(GdbCommand::SetWatchpoint { expr, kind })
+                            .await;
+                    }
+                }
+                InputMode::RegisterEdit => {
+                    // Buffer is "name value"
+                    let parts: Vec<&str> = buf.splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        let name = parts[0].trim().to_string();
+                        let value = parts[1].trim().to_string();
+                        if !name.is_empty() && !value.is_empty() {
+                            let _ = cmd_tx
+                                .send(GdbCommand::SetRegister { name, value })
+                                .await;
+                        }
+                    }
+                }
                 InputMode::Search => {
                     // Perform source search
                     let snap = state.load();
@@ -832,6 +1445,130 @@ async fn dispatch_action(
                         view.source_cursor = first;
                         view.source_follow_exec = false;
                     }
+                }
+                InputMode::SearchMemory => {
+                    // Format: "pattern [start_addr [length]]"
+                    // If pattern starts with \x, treat as hex bytes.
+                    // Otherwise, treat as string search.
+                    let snap = state.load();
+                    let mem_start = snap.memory_address;
+                    let mem_len = snap.memory.as_ref().map_or(0, |m| m.bytes.len());
+                    drop(snap);
+
+                    // Use a generous default search range if memory is loaded,
+                    // otherwise search from 0 with a large range.
+                    let (default_start, default_len) = if mem_len > 0 {
+                        (mem_start, 0x100000u64) // 1 MiB from current memory address
+                    } else {
+                        (0u64, 0x100000u64)
+                    };
+
+                    let parts: Vec<&str> = buf.splitn(3, ' ').collect();
+                    let pattern = parts.first().map(|s| *s).unwrap_or("");
+                    let start = parts
+                        .get(1)
+                        .and_then(|s| {
+                            let stripped = s.trim_start_matches("0x").trim_start_matches("0X");
+                            u64::from_str_radix(stripped, 16).ok()
+                        })
+                        .unwrap_or(default_start);
+                    let length = parts
+                        .get(2)
+                        .and_then(|s| {
+                            let stripped = s.trim_start_matches("0x").trim_start_matches("0X");
+                            u64::from_str_radix(stripped, 16)
+                                .ok()
+                                .or_else(|| s.parse::<u64>().ok())
+                        })
+                        .unwrap_or(default_len);
+
+                    if pattern.starts_with("\\x") || pattern.starts_with("0x") {
+                        // Parse as hex bytes: \xNN\xNN... or 0xNN0xNN...
+                        let hex_str = pattern
+                            .replace("\\x", "")
+                            .replace("0x", "")
+                            .replace(' ', "");
+                        let mut bytes = Vec::new();
+                        let mut chars = hex_str.chars();
+                        let mut valid = true;
+                        while let (Some(hi), Some(lo)) = (chars.next(), chars.next()) {
+                            if let (Some(h), Some(l)) = (hi.to_digit(16), lo.to_digit(16)) {
+                                bytes.push(((h << 4) | l) as u8);
+                            } else {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        if valid && !bytes.is_empty() {
+                            let _ = cmd_tx
+                                .send(GdbCommand::SearchMemoryBytes { start, length, bytes })
+                                .await;
+                        }
+                    } else if !pattern.is_empty() {
+                        let _ = cmd_tx
+                            .send(GdbCommand::SearchMemoryString {
+                                start,
+                                length,
+                                pattern: pattern.to_string(),
+                            })
+                            .await;
+                    }
+                }
+                InputMode::PatchBytes => {
+                    // Format: "address hex_bytes..."
+                    // e.g. "0x401000 90 90 90" or "0x401000 eb fe"
+                    let parts: Vec<&str> = buf.splitn(2, ' ').collect();
+                    if let Some(addr_str) = parts.first() {
+                        let stripped = addr_str
+                            .trim_start_matches("0x")
+                            .trim_start_matches("0X");
+                        if let Ok(addr) = u64::from_str_radix(stripped, 16) {
+                            if let Some(hex_part) = parts.get(1) {
+                                let hex_clean = hex_part.replace(' ', "");
+                                let mut bytes = Vec::new();
+                                let mut chars = hex_clean.chars();
+                                let mut valid = true;
+                                while let (Some(hi), Some(lo)) = (chars.next(), chars.next()) {
+                                    if let (Some(h), Some(l)) =
+                                        (hi.to_digit(16), lo.to_digit(16))
+                                    {
+                                        bytes.push(((h << 4) | l) as u8);
+                                    } else {
+                                        valid = false;
+                                        break;
+                                    }
+                                }
+                                if valid && !bytes.is_empty() {
+                                    let _ = cmd_tx
+                                        .send(GdbCommand::PatchBytes { addr, bytes })
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                }
+                InputMode::TypeOverlay => {
+                    // Format: "0xADDR type_expression" e.g. "0x7fff5000 struct sockaddr_in"
+                    let parts: Vec<&str> = buf.splitn(2, ' ').collect();
+                    if let Some(addr_str) = parts.first() {
+                        let stripped = addr_str
+                            .trim_start_matches("0x")
+                            .trim_start_matches("0X");
+                        if let Ok(addr) = u64::from_str_radix(stripped, 16) {
+                            if let Some(type_expr) = parts.get(1) {
+                                let type_expr = type_expr.trim().to_string();
+                                if !type_expr.is_empty() {
+                                    let _ = cmd_tx
+                                        .send(GdbCommand::TypeOverlay { addr, type_expr })
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                }
+                InputMode::ListFunctions => {
+                    let pattern = if buf.is_empty() { None } else { Some(buf) };
+                    let _ = cmd_tx.send(GdbCommand::ListFunctions(pattern)).await;
                 }
                 InputMode::Normal => {} // unreachable
             }
@@ -999,6 +1736,280 @@ async fn dispatch_action(
                 view.mem_edit_nibble = None;
             }
         }
+
+        // ---- Timeline / playback ----
+        Action::PlaybackPrev => {
+            if view.rec_count > 0 {
+                if view.playback_mode {
+                    if view.playback_index > 0 {
+                        view.playback_index -= 1;
+                    }
+                } else {
+                    // Enter playback mode at the last recorded state
+                    view.playback_mode = true;
+                    view.playback_index = view.rec_count.saturating_sub(1);
+                    // Then step back one if possible
+                    if view.playback_index > 0 {
+                        view.playback_index -= 1;
+                    }
+                }
+            }
+        }
+        Action::PlaybackNext => {
+            if view.playback_mode {
+                if view.playback_index + 1 < view.rec_count {
+                    view.playback_index += 1;
+                } else {
+                    // Past the end — return to live mode
+                    view.playback_mode = false;
+                    view.source_follow_exec = true;
+                }
+            }
+        }
+        Action::PlaybackFirst => {
+            if view.rec_count > 0 {
+                view.playback_mode = true;
+                view.playback_index = 0;
+            }
+        }
+        Action::PlaybackLast => {
+            if view.playback_mode {
+                // Return to live mode
+                view.playback_mode = false;
+                view.source_follow_exec = true;
+            }
+        }
+        Action::ToggleRecording => {
+            if let Ok(mut rec) = recording.lock() {
+                rec.enabled = !rec.enabled;
+            }
+        }
+        Action::ClearRecording => {
+            view.playback_mode = false;
+            view.rec_playback_snap = None;
+            view.rec_entries.clear();
+            view.rec_diff = None;
+            view.rec_count = 0;
+            view.exec_flow = None;
+            view.exec_flow_computed_at = 0;
+            view.source_follow_exec = true;
+            if let Ok(mut rec) = recording.lock() {
+                rec.clear();
+            }
+        }
+        Action::PlaybackPrevAnchor => {
+            if let Ok(rec) = recording.lock() {
+                let from = if view.playback_mode {
+                    view.playback_index
+                } else {
+                    rec.len().saturating_sub(1)
+                };
+                if let Some(idx) = rec.prev_anchor(from) {
+                    view.playback_mode = true;
+                    view.playback_index = idx;
+                }
+            }
+        }
+        Action::PlaybackNextAnchor => {
+            if let Ok(rec) = recording.lock() {
+                let from = if view.playback_mode {
+                    view.playback_index
+                } else {
+                    0
+                };
+                if let Some(idx) = rec.next_anchor(from) {
+                    if idx >= rec.len().saturating_sub(1) {
+                        view.playback_mode = false;
+                    } else {
+                        view.playback_mode = true;
+                        view.playback_index = idx;
+                    }
+                } else {
+                    view.playback_mode = false;
+                }
+            }
+        }
+
+        // ---- Playback analysis ----
+        Action::ShowValueHistory => {
+            if view.playback_mode {
+                if let Ok(rec) = recording.lock() {
+                    let snap = state.load();
+                    let history = match view.focused_panel {
+                        Panel::Locals => {
+                            let render = view.rec_playback_snap.as_ref().unwrap_or(&snap);
+                            let var_name = render
+                                .locals
+                                .get(view.locals_selected)
+                                .map(|v| v.name.clone());
+                            var_name.map(|name| build_var_history(&rec, &name))
+                        }
+                        Panel::Registers => {
+                            let render = view.rec_playback_snap.as_ref().unwrap_or(&snap);
+                            let reg_name = render
+                                .registers
+                                .get(view.registers_scroll)
+                                .map(|r| r.name.clone());
+                            reg_name.map(|name| build_reg_history(&rec, &name))
+                        }
+                        _ => None,
+                    };
+                    drop(snap);
+
+                    if let Some((entries, var_name, is_register)) = history {
+                        let total = rec.len();
+                        drop(rec);
+                        // Format and push to output
+                        let mut s = (**state.load()).clone();
+                        let changes = entries.len();
+                        s.push_output(
+                            crate::state::OutputKind::Info,
+                            format!(
+                                "--- History of '{}' ({} changes across {} states) ---",
+                                var_name, changes, total
+                            ),
+                        );
+                        for (seq, label, loc, value) in &entries {
+                            let loc_str = loc.as_deref().unwrap_or("??");
+                            if is_register {
+                                s.push_output(
+                                    crate::state::OutputKind::Console,
+                                    format!(
+                                        "  #{:<4} {:<6} {:<16} {} = {}",
+                                        seq, label, loc_str, var_name, value
+                                    ),
+                                );
+                            } else {
+                                s.push_output(
+                                    crate::state::OutputKind::Console,
+                                    format!(
+                                        "  #{:<4} {:<6} {:<16} {} = {}",
+                                        seq, label, loc_str, var_name, value
+                                    ),
+                                );
+                            }
+                        }
+                        // Build trend line for numeric values
+                        let trend = build_value_trend(&entries);
+                        if !trend.is_empty() {
+                            s.push_output(
+                                crate::state::OutputKind::Info,
+                                format!("  Trend: {}", trend),
+                            );
+                        }
+                        state.store(Arc::new(s));
+                    }
+                }
+            }
+        }
+
+        // ---- Libraries ----
+        Action::ShowLibraries => {
+            let _ = cmd_tx.send(GdbCommand::RefreshLibraries).await;
+            // Also show a summary of notification-tracked libraries
+            let snap = state.load();
+            let count = snap.mapped_libs.len();
+            if count > 0 {
+                let summary = format!(
+                    "{count} loaded libraries (L for details in output panel)"
+                );
+                drop(snap);
+                let mut s = (**state.load()).clone();
+                s.push_output(crate::state::OutputKind::Info, summary);
+                state.store(Arc::new(s));
+            }
+        }
+
+        // ---- Memory search ----
+        Action::PromptSearchMemory => {
+            view.start_input(InputMode::SearchMemory);
+        }
+
+        // ---- Disasm patching ----
+        Action::PatchNop => {
+            if view.focused_panel == Panel::Disasm {
+                let snap = state.load();
+                let cursor = view.disasm_cursor;
+                if let Some(inst) = snap.disasm.get(cursor) {
+                    let addr = inst.address;
+                    // Compute instruction length from address gap to next instruction
+                    let inst_len = if let Some(next) = snap.disasm.get(cursor + 1) {
+                        (next.address - addr) as usize
+                    } else {
+                        // Last instruction — assume a conservative default
+                        // (1 byte for x86 single-byte instructions, but typically
+                        // instructions are at least 1 byte).
+                        1
+                    };
+                    if inst_len > 0 && inst_len <= 15 {
+                        let nop_bytes = vec![0x90u8; inst_len];
+                        let _ = cmd_tx
+                            .send(GdbCommand::PatchBytes {
+                                addr,
+                                bytes: nop_bytes,
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
+        Action::PromptPatchBytes => {
+            if view.focused_panel == Panel::Disasm {
+                let snap = state.load();
+                if let Some(inst) = snap.disasm.get(view.disasm_cursor) {
+                    let prefill = format!("{:#x} ", inst.address);
+                    view.start_input_with(InputMode::PatchBytes, prefill);
+                } else {
+                    view.start_input(InputMode::PatchBytes);
+                }
+            } else {
+                view.start_input(InputMode::PatchBytes);
+            }
+        }
+
+        // ---- Analysis ----
+        Action::AnalyzeXrefs => {
+            if view.focused_panel == Panel::Disasm {
+                let snap = state.load();
+                if let Some(inst) = snap.disasm.get(view.disasm_cursor) {
+                    let addr = inst.address;
+                    let _ = cmd_tx
+                        .send(GdbCommand::AnalyzeXrefs { addr })
+                        .await;
+                }
+            }
+        }
+        Action::PromptTypeOverlay => {
+            let snap = state.load();
+            // Try to prefill the address from the current context
+            let prefill = if view.focused_panel == Panel::Disasm {
+                snap.disasm.get(view.disasm_cursor)
+                    .map(|inst| format!("0x{:x} ", inst.address))
+            } else if view.focused_panel == Panel::Memory {
+                snap.memory.as_ref()
+                    .map(|m| format!("0x{:x} ", m.address + view.mem_cursor as u64))
+            } else {
+                None
+            };
+            match prefill {
+                Some(p) => view.start_input_with(InputMode::TypeOverlay, p),
+                None => view.start_input(InputMode::TypeOverlay),
+            }
+        }
+        Action::PromptListFunctions => {
+            view.start_input(InputMode::ListFunctions);
+        }
+        Action::ResolveSymbol => {
+            if view.focused_panel == Panel::Disasm {
+                let snap = state.load();
+                if let Some(inst) = snap.disasm.get(view.disasm_cursor) {
+                    let addr = inst.address;
+                    let _ = cmd_tx
+                        .send(GdbCommand::ResolveSymbol(addr))
+                        .await;
+                }
+            }
+        }
     }
 
     false
@@ -1046,6 +2057,142 @@ async fn dispatch_mem_hex(
             }
             true
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Playback analysis helpers
+// ---------------------------------------------------------------------------
+
+/// Build the value history of a local variable across all recorded states.
+/// Returns (entries, variable_name, is_register).
+/// Each entry is (seq, stop_label, source_loc, value).
+fn build_var_history(
+    rec: &Recording,
+    name: &str,
+) -> (Vec<(u64, String, Option<String>, String)>, String, bool) {
+    let mut history = Vec::new();
+    let mut last_value = String::new();
+    for i in 0..rec.len() {
+        if let Some(state) = rec.get(i) {
+            if let Some(var) = state.locals.iter().find(|v| v.name == name) {
+                if var.value != last_value {
+                    let loc = match (&state.source_path, state.source_line) {
+                        (Some(p), Some(l)) => {
+                            let short = p.rsplit('/').next().unwrap_or(p);
+                            Some(format!("{short}:{l}"))
+                        }
+                        _ => None,
+                    };
+                    let label = stop_reason_label(&state.stop_reason);
+                    history.push((state.seq, label, loc, var.value.clone()));
+                    last_value = var.value.clone();
+                }
+            }
+        }
+    }
+    (history, name.to_string(), false)
+}
+
+/// Build the value history of a register across all recorded states.
+/// Returns (entries, register_name, is_register).
+fn build_reg_history(
+    rec: &Recording,
+    name: &str,
+) -> (Vec<(u64, String, Option<String>, String)>, String, bool) {
+    let mut history = Vec::new();
+    let mut last_value = String::new();
+    for i in 0..rec.len() {
+        if let Some(state) = rec.get(i) {
+            if let Some(reg) = state.registers.iter().find(|r| r.name == name) {
+                if reg.value != last_value {
+                    let loc = if let Some(frame) = state.stack.first() {
+                        Some(format!("{:#x}", frame.addr))
+                    } else {
+                        None
+                    };
+                    let label = stop_reason_label(&state.stop_reason);
+                    history.push((state.seq, label, loc, reg.value.clone()));
+                    last_value = reg.value.clone();
+                }
+            }
+        }
+    }
+    (history, name.to_string(), true)
+}
+
+/// Build a one-line trend summary from value history entries.
+/// Attempts to parse values as integers and shows a compact representation.
+fn build_value_trend(entries: &[(u64, String, Option<String>, String)]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    let parsed: Vec<Option<i128>> = entries
+        .iter()
+        .map(|(_, _, _, val)| parse_int_value(val))
+        .collect();
+
+    // If all values are parseable as integers, show trend
+    if parsed.iter().all(|v| v.is_some()) {
+        let nums: Vec<i128> = parsed.into_iter().flatten().collect();
+        if nums.len() <= 8 {
+            let parts: Vec<String> = nums.iter().map(|n| format!("{n}")).collect();
+            let trend_desc = classify_trend(&nums);
+            if trend_desc.is_empty() {
+                parts.join(" -> ")
+            } else {
+                format!("{}  ({})", parts.join(" -> "), trend_desc)
+            }
+        } else {
+            // Show first 3, ..., last 3
+            let first: Vec<String> = nums[..3].iter().map(|n| format!("{n}")).collect();
+            let last: Vec<String> = nums[nums.len() - 3..].iter().map(|n| format!("{n}")).collect();
+            let trend_desc = classify_trend(&nums);
+            if trend_desc.is_empty() {
+                format!("{} -> ... -> {}", first.join(" -> "), last.join(" -> "))
+            } else {
+                format!(
+                    "{} -> ... -> {}  ({})",
+                    first.join(" -> "),
+                    last.join(" -> "),
+                    trend_desc
+                )
+            }
+        }
+    } else {
+        // Non-numeric values, just show count
+        String::new()
+    }
+}
+
+/// Try to parse a value string as an integer (handles hex, decimal, negative).
+fn parse_int_value(val: &str) -> Option<i128> {
+    let trimmed = val.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        i128::from_str_radix(hex, 16).ok()
+    } else {
+        trimmed.parse::<i128>().ok()
+    }
+}
+
+/// Classify a numeric trend (monotonic increase, decrease, constant, etc.)
+fn classify_trend(nums: &[i128]) -> &'static str {
+    if nums.len() <= 1 {
+        return "";
+    }
+    let all_inc = nums.windows(2).all(|w| w[1] >= w[0]);
+    let all_dec = nums.windows(2).all(|w| w[1] <= w[0]);
+    let all_same = nums.windows(2).all(|w| w[1] == w[0]);
+
+    if all_same {
+        "constant"
+    } else if all_inc {
+        "monotonic increase"
+    } else if all_dec {
+        "monotonic decrease"
+    } else {
+        ""
     }
 }
 
@@ -1193,7 +2340,8 @@ fn is_keyword(s: &str) -> bool {
 
 fn draw(f: &mut ratatui::Frame, snap: &GdbSnapshot, view: &ViewState) {
     let visible = view.visible_panels_ordered();
-    let panel_layout = layout::compute(f.area(), &visible);
+    let show_timeline = view.rec_count > 0 || view.playback_mode;
+    let panel_layout = layout::compute_with_timeline(f.area(), &visible, show_timeline);
 
     // Status bar
     widgets::status_bar::draw(f, panel_layout.status_bar, snap);
@@ -1211,6 +2359,11 @@ fn draw(f: &mut ratatui::Frame, snap: &GdbSnapshot, view: &ViewState) {
     // Output area
     if let Some(rect) = panel_layout.output_area {
         panels::output::draw(f, rect, snap, view);
+    }
+
+    // Timeline bar
+    if let Some(rect) = panel_layout.timeline_area {
+        panels::timeline::draw(f, rect, view);
     }
 
     // Footer

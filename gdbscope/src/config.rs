@@ -22,6 +22,9 @@ pub struct Config {
     pub gdb_path: String,
     pub redraw_hz: u32,
     pub debug: bool,
+    pub record_max: usize,
+    pub record_secs: Option<u64>,
+    pub trace_depth: usize,
 }
 
 impl Config {
@@ -91,6 +94,13 @@ impl Config {
             gdb_path: args.gdb_path,
             redraw_hz: args.redraw_hz,
             debug: args.debug,
+            record_max: args.record_max,
+            record_secs: if args.record_secs == 0 {
+                None
+            } else {
+                Some(args.record_secs)
+            },
+            trace_depth: args.trace_depth,
         })
     }
 }

@@ -6,6 +6,17 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// The kind of access a hardware watchpoint monitors.
+#[derive(Debug, Clone, Copy)]
+pub enum WatchKind {
+    /// Trigger on write (default).
+    Write,
+    /// Trigger on read.
+    Read,
+    /// Trigger on read or write.
+    Access,
+}
+
 pub struct MiCommandBuilder {
     next_token: AtomicU64,
 }
@@ -76,10 +87,22 @@ impl MiCommandBuilder {
         (tok, format!("{tok}-stack-list-frames\n"))
     }
 
+    /// `-stack-info-frame` — get just the current frame (faster than list-frames)
+    pub fn stack_info_frame(&self) -> (u64, String) {
+        let tok = self.next();
+        (tok, format!("{tok}-stack-info-frame\n"))
+    }
+
     /// `-stack-list-locals --all-values`
     pub fn stack_list_locals(&self) -> (u64, String) {
         let tok = self.next();
         (tok, format!("{tok}-stack-list-locals --all-values\n"))
+    }
+
+    /// `-stack-list-locals --simple-values` (faster — skips complex type evaluation)
+    pub fn stack_list_locals_simple(&self) -> (u64, String) {
+        let tok = self.next();
+        (tok, format!("{tok}-stack-list-locals --simple-values\n"))
     }
 
     /// `-stack-select-frame {level}`
@@ -111,7 +134,8 @@ impl MiCommandBuilder {
     /// `-break-insert {location}`
     pub fn break_insert(&self, location: &str) -> (u64, String) {
         let tok = self.next();
-        (tok, format!("{tok}-break-insert {location}\n"))
+        let escaped = location.replace('\\', "\\\\").replace('"', "\\\"");
+        (tok, format!("{tok}-break-insert \"{escaped}\"\n"))
     }
 
     /// `-break-delete {number}`
@@ -136,6 +160,44 @@ impl MiCommandBuilder {
     pub fn break_list(&self) -> (u64, String) {
         let tok = self.next();
         (tok, format!("{tok}-break-list\n"))
+    }
+
+    /// `-break-insert -c "condition" "location"` — insert with an inline condition.
+    pub fn break_insert_cond(&self, location: &str, condition: &str) -> (u64, String) {
+        let tok = self.next();
+        let loc_escaped = location.replace('\\', "\\\\").replace('"', "\\\"");
+        let cond_escaped = condition.replace('\\', "\\\\").replace('"', "\\\"");
+        (tok, format!("{tok}-break-insert -c \"{cond_escaped}\" \"{loc_escaped}\"\n"))
+    }
+
+    /// `-break-condition {number} {expr}` — set or change a condition on an
+    /// existing breakpoint.
+    pub fn break_condition(&self, number: u32, expr: &str) -> (u64, String) {
+        let tok = self.next();
+        let escaped = expr.replace('\\', "\\\\").replace('"', "\\\"");
+        (tok, format!("{tok}-break-condition {number} {escaped}\n"))
+    }
+
+    /// `-break-watch [-a|-r] "expr"` — set a hardware watchpoint.
+    pub fn break_watch(&self, expr: &str, access: WatchKind) -> (u64, String) {
+        let tok = self.next();
+        let flag = match access {
+            WatchKind::Write => "",
+            WatchKind::Read => "-r ",
+            WatchKind::Access => "-a ",
+        };
+        let escaped = expr.replace('\\', "\\\\").replace('"', "\\\"");
+        (tok, format!("{tok}-break-watch {flag}\"{escaped}\"\n"))
+    }
+
+    /// Set a register value via the GDB CLI (`set $name = value`).
+    ///
+    /// We use `-interpreter-exec console` because the MI interface only
+    /// supports setting registers by number, while the CLI form accepts
+    /// symbolic names which is far more user-friendly.
+    pub fn set_register(&self, name: &str, value: &str) -> (u64, String) {
+        let tok = self.next();
+        (tok, format!("{tok}-interpreter-exec console \"set ${name} = {value}\"\n"))
     }
 
     // -----------------------------------------------------------------
@@ -214,6 +276,94 @@ impl MiCommandBuilder {
     pub fn target_core(&self, path: &str) -> (u64, String) {
         let tok = self.next();
         (tok, format!("{tok}-target-select core {path}\n"))
+    }
+
+    // -----------------------------------------------------------------
+    // Memory search
+    // -----------------------------------------------------------------
+
+    /// Search memory for a string using GDB's `find` command.
+    ///
+    /// Produces: `-interpreter-exec console "find 0xSTART, +LEN, \"pattern\""`
+    pub fn find_string(&self, start: u64, length: u64, pattern: &str) -> (u64, String) {
+        let tok = self.next();
+        let escaped = pattern
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        (
+            tok,
+            format!(
+                "{tok}-interpreter-exec console \"find 0x{start:x}, +0x{length:x}, \\\"{escaped}\\\"\"\n"
+            ),
+        )
+    }
+
+    /// Search memory for a raw byte pattern using GDB's `find /b` command.
+    ///
+    /// Produces: `-interpreter-exec console "find /b 0xSTART, +LEN, 0xAA, 0xBB, ..."`
+    pub fn find_bytes(&self, start: u64, length: u64, bytes: &[u8]) -> (u64, String) {
+        let tok = self.next();
+        let byte_args: String = bytes
+            .iter()
+            .map(|b| format!("0x{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        (
+            tok,
+            format!(
+                "{tok}-interpreter-exec console \"find /b 0x{start:x}, +0x{length:x}, {byte_args}\"\n"
+            ),
+        )
+    }
+
+    // -----------------------------------------------------------------
+    // Analysis commands (xrefs, type overlay, function listing)
+    // -----------------------------------------------------------------
+
+    /// `info functions [regexp]` -- list matching functions via CLI.
+    pub fn info_functions(&self, pattern: &str) -> (u64, String) {
+        let tok = self.next();
+        let escaped = pattern.replace('\\', "\\\\").replace('"', "\\\"");
+        (tok, format!("{tok}-interpreter-exec console \"info functions {escaped}\"\n"))
+    }
+
+    /// `-symbol-info-functions [--name regexp]` — structured function listing.
+    pub fn symbol_info_functions(&self, pattern: Option<&str>) -> (u64, String) {
+        let tok = self.next();
+        match pattern {
+            Some(p) => {
+                let escaped = p.replace('\\', "\\\\").replace('"', "\\\"");
+                (tok, format!("{tok}-symbol-info-functions --name \"{escaped}\"\n"))
+            }
+            None => (tok, format!("{tok}-symbol-info-functions\n")),
+        }
+    }
+
+    /// `disassemble func` -- disassemble a named function to find call targets.
+    pub fn disassemble_function(&self, func: &str) -> (u64, String) {
+        let tok = self.next();
+        let escaped = func.replace('\\', "\\\\").replace('"', "\\\"");
+        (tok, format!("{tok}-interpreter-exec console \"disassemble {escaped}\"\n"))
+    }
+
+    /// `ptype type_name` -- show type structure via CLI.
+    pub fn ptype(&self, type_name: &str) -> (u64, String) {
+        let tok = self.next();
+        let escaped = type_name.replace('\\', "\\\\").replace('"', "\\\"");
+        (tok, format!("{tok}-interpreter-exec console \"ptype {escaped}\"\n"))
+    }
+
+    /// Print memory as a typed value: `*(type*)addr` via `-data-evaluate-expression`.
+    pub fn print_typed(&self, type_expr: &str, addr: u64) -> (u64, String) {
+        let tok = self.next();
+        let escaped = type_expr.replace('\\', "\\\\").replace('"', "\\\"");
+        (tok, format!("{tok}-data-evaluate-expression \"*({escaped}*)0x{addr:x}\"\n"))
+    }
+
+    /// `info symbol addr` -- resolve an address to the nearest symbol.
+    pub fn info_symbol(&self, addr: u64) -> (u64, String) {
+        let tok = self.next();
+        (tok, format!("{tok}-interpreter-exec console \"info symbol 0x{addr:x}\"\n"))
     }
 
     // -----------------------------------------------------------------
@@ -315,7 +465,7 @@ mod tests {
     fn break_insert_format() {
         let b = MiCommandBuilder::new();
         let (tok, cmd) = b.break_insert("main.c:42");
-        assert_eq!(cmd, format!("{tok}-break-insert main.c:42\n"));
+        assert_eq!(cmd, format!("{tok}-break-insert \"main.c:42\"\n"));
     }
 
     #[test]

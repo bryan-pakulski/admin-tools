@@ -9,3 +9,4 @@ pub mod disasm;
 pub mod watch;
 pub mod output;
 pub mod command;
+pub mod timeline;

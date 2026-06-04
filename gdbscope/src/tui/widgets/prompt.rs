@@ -15,10 +15,18 @@ pub fn draw(f: &mut Frame, area: Rect, view: &ViewState) {
     let label = match view.input_mode {
         InputMode::Command => ":",
         InputMode::Breakpoint => "break ",
+        InputMode::BreakpointCond => "break (loc if cond) ",
+        InputMode::BreakCondEdit => "condition (num cond) ",
+        InputMode::Watchpoint => "watchpoint (expr [r|w|rw]) ",
+        InputMode::RegisterEdit => "set reg (name value) ",
         InputMode::Watch => "watch ",
         InputMode::Memory => "memory ",
         InputMode::Eval => "eval ",
         InputMode::Search => "/",
+        InputMode::SearchMemory => "search mem ",
+        InputMode::PatchBytes => "patch (addr hex) ",
+        InputMode::TypeOverlay => "type overlay (addr type) ",
+        InputMode::ListFunctions => "functions (filter or Enter for all) ",
         InputMode::Normal => return,
     };
 

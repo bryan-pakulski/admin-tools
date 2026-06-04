@@ -40,11 +40,31 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
         let mode_label = match view.input_mode {
             InputMode::Command => "COMMAND",
             InputMode::Breakpoint => "BREAKPOINT",
+            InputMode::BreakpointCond => "COND BREAK",
+            InputMode::BreakCondEdit => "EDIT COND",
+            InputMode::Watchpoint => "WATCHPOINT",
+            InputMode::RegisterEdit => "EDIT REG",
             InputMode::Watch => "WATCH",
             InputMode::Memory => "MEMORY",
             InputMode::Eval => "EVAL",
             InputMode::Search => "SEARCH",
+            InputMode::SearchMemory => "SEARCH MEM",
+            InputMode::PatchBytes => "PATCH BYTES",
+            InputMode::TypeOverlay => "TYPE OVERLAY",
+            InputMode::ListFunctions => "FUNCTIONS",
             InputMode::Normal => unreachable!(),
+        };
+
+        let format_hint = match view.input_mode {
+            InputMode::BreakpointCond => "  loc if cond  (e.g. main.c:42 if x>0)",
+            InputMode::Watchpoint => "  expr [r|w|rw]  (e.g. my_var rw)",
+            InputMode::RegisterEdit => "  name value  (e.g. rax 0x42)",
+            InputMode::Memory => "  addr [len] or &expr  (e.g. &buf 512)",
+            InputMode::SearchMemory => "  text or \\xHH  (e.g. hello or \\x90\\x90)",
+            InputMode::PatchBytes => "  addr hex_bytes  (e.g. 0x401000 90 90)",
+            InputMode::TypeOverlay => "  addr type  (e.g. 0x7fff struct foo)",
+            InputMode::ListFunctions => "  regex filter (or Enter for all, max 200 shown)",
+            _ => "",
         };
 
         let line = Line::from(vec![
@@ -56,6 +76,7 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" Enter=submit  Esc=cancel  Up/Down=history"),
+            Span::styled(format_hint, Style::default().fg(Color::DarkGray)),
         ]);
         let bar = Paragraph::new(line).style(Style::default().bg(Color::DarkGray));
         f.render_widget(bar, rect);
@@ -65,6 +86,7 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
     // Global execution hints (always shown)
     let mut spans: Vec<Span> = vec![
         key(" F5"), sep(":Run "),
+        key("F6"), sep(":Trace "),
         key("F7"), sep(":Into "),
         key("F8"), sep(":Next "),
         key("F9"), sep(":Out "),
@@ -100,6 +122,9 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
                 key("d"), sep(":Del "),
                 key("e"), sep(":Toggle "),
                 key("b"), sep(":New "),
+                key("B"), sep(":CondBrk "),
+                key("c"), sep(":EditCond "),
+                key("W"), sep(":Watchpt "),
             ]);
         }
         Panel::Locals => {
@@ -109,6 +134,11 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
                 key("p"), sep(":Eval "),
                 key("m"), sep(":Memory "),
             ]);
+            if view.playback_mode {
+                spans.extend_from_slice(&[
+                    key("H"), sep(":History "),
+                ]);
+            }
         }
         Panel::Watch => {
             spans.extend_from_slice(&[
@@ -122,8 +152,14 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
         Panel::Registers => {
             spans.extend_from_slice(&[
                 sep("| "),
+                key("E"), sep(":Edit "),
                 key("6"), sep(":Toggle "),
             ]);
+            if view.playback_mode {
+                spans.extend_from_slice(&[
+                    key("H"), sep(":History "),
+                ]);
+            }
         }
         Panel::Memory => {
             if view.mem_edit {
@@ -137,6 +173,8 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
                 spans.extend_from_slice(&[
                     sep("| "),
                     key("m"), sep(":GoAddr "),
+                    key("Enter"), sep(":FollowPtr "),
+                    key("S"), sep(":Search "),
                     key("v"), sep(":Select "),
                     key("t"), sep(":Cast "),
                     key("i"), sep(":Edit "),
@@ -147,7 +185,13 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
         Panel::Disasm => {
             spans.extend_from_slice(&[
                 sep("| "),
-                key("8"), sep(":Toggle "),
+                key("Enter"), sep(":BrkAtAddr "),
+                key("F10"), sep(":TogBrk "),
+                key("x"), sep(":Xrefs "),
+                key("s"), sep(":Symbol "),
+                key("T"), sep(":TypeCast "),
+                key("P"), sep(":NOP "),
+                key("a"), sep(":Patch "),
             ]);
         }
         Panel::Output => {
@@ -155,6 +199,36 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
                 sep("| "),
                 key(":"), sep(":Cmd "),
                 key(";"), sep(":Repeat "),
+            ]);
+        }
+    }
+
+    // Playback hints (shown when recording has entries)
+    if view.rec_count > 0 {
+        spans.push(sep("| "));
+        if view.playback_mode {
+            spans.extend_from_slice(&[
+                Span::styled(
+                    " PLAYBACK ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                sep(" "),
+                key("["), sep(":Prev "),
+                key("]"), sep(":Next "),
+                key("<"), sep(":PrevBP "),
+                key(">"), sep(":NextBP "),
+                key("}"), sep(":Live "),
+            ]);
+        } else {
+            spans.extend_from_slice(&[
+                key("["), sep(":Rewind "),
+                key("<"), sep(":PrevBP "),
+                key("R"), sep(":Rec"),
+                sep(if view.rec_enabled { "On " } else { "Off " }),
+                key("C"), sep(":Clear "),
             ]);
         }
     }
@@ -179,8 +253,18 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
         String::new()
     };
 
+    // Library count indicator
+    let lib_info = if !snap.mapped_libs.is_empty() {
+        format!("{}libs", snap.mapped_libs.len())
+    } else {
+        String::new()
+    };
+
     spans.extend_from_slice(&[
         sep("| "),
+        key("f"), sep(":Funcs "),
+        key("L"), sep(":Libs "),
+        key("S"), sep(":MemSearch "),
         key("?"), sep(":Help "),
         key("q"), sep(":Quit"),
         sep("  "),
@@ -188,6 +272,10 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
         sep(" "),
         Span::styled(frame_info, Style::default().fg(Color::DarkGray)),
     ]);
+    if !lib_info.is_empty() {
+        spans.push(sep(" "));
+        spans.push(Span::styled(lib_info, Style::default().fg(Color::DarkGray)));
+    }
 
     let line = Line::from(spans);
     let bar = Paragraph::new(line).style(

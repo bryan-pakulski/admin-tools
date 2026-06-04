@@ -59,8 +59,89 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
     let source = match &snap.source {
         Some(src) => src,
         None => {
-            let msg = Paragraph::new("No source loaded. Press F5 to run, or b to set a breakpoint.")
-                .style(Style::default().fg(Color::DarkGray));
+            let mut lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  No source code available for the current frame.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+            ];
+
+            // Detect runtime and show language-specific hints
+            let is_python = snap.stack.iter().any(|f| {
+                f.func.as_deref().map_or(false, |n| n.contains("PyEval") || n.contains("_Py"))
+            });
+            let is_ruby = snap.stack.iter().any(|f| {
+                f.func.as_deref().map_or(false, |n| n.contains("rb_") || n.contains("ruby"))
+            });
+            let is_java = snap.stack.iter().any(|f| {
+                f.func.as_deref().map_or(false, |n| n.contains("JVM") || n.contains("JavaThread"))
+            });
+            let is_node = snap.stack.iter().any(|f| {
+                f.func.as_deref().map_or(false, |n| n.contains("v8::") || n.contains("node::"))
+            });
+
+            if is_python {
+                lines.extend_from_slice(&[
+                    Line::from(Span::styled(
+                        "  Python runtime detected. Try these GDB commands (:):",
+                        Style::default().fg(Color::Yellow),
+                    )),
+                    Line::from(Span::styled("    py-bt          Python backtrace", Style::default().fg(Color::Cyan))),
+                    Line::from(Span::styled("    py-list        Python source at current frame", Style::default().fg(Color::Cyan))),
+                    Line::from(Span::styled("    py-locals      Python local variables", Style::default().fg(Color::Cyan))),
+                    Line::from(Span::styled("    py-print EXPR  Evaluate Python expression", Style::default().fg(Color::Cyan))),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Press : to enter a command, or navigate stack with [2].",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ]);
+            } else if is_ruby {
+                lines.extend_from_slice(&[
+                    Line::from(Span::styled(
+                        "  Ruby runtime detected. Try: rb_backtrace, rb_ps",
+                        Style::default().fg(Color::Yellow),
+                    )),
+                ]);
+            } else if is_java {
+                lines.extend_from_slice(&[
+                    Line::from(Span::styled(
+                        "  JVM detected. Try: info threads, thread apply all bt",
+                        Style::default().fg(Color::Yellow),
+                    )),
+                ]);
+            } else if is_node {
+                lines.extend_from_slice(&[
+                    Line::from(Span::styled(
+                        "  Node.js/V8 detected. Try: v8 bt, v8 source",
+                        Style::default().fg(Color::Yellow),
+                    )),
+                ]);
+            } else if snap.target_state == crate::state::TargetState::Stopped && !snap.stack.is_empty() {
+                lines.extend_from_slice(&[
+                    Line::from(Span::styled(
+                        "  No debug symbols. Use these panels instead:",
+                        Style::default().fg(Color::Yellow),
+                    )),
+                    Line::from(Span::styled("    [8] Disasm     Disassembly view (primary for RE)", Style::default().fg(Color::Cyan))),
+                    Line::from(Span::styled("    [6] Registers  CPU register values", Style::default().fg(Color::Cyan))),
+                    Line::from(Span::styled("    [7] Memory     Hex memory browser", Style::default().fg(Color::Cyan))),
+                    Line::from(""),
+                    Line::from(Span::styled("    x  Xrefs    f  Functions    s  Symbols", Style::default().fg(Color::Cyan))),
+                    Line::from(Span::styled("    P  NOP      a  Patch        T  Type cast", Style::default().fg(Color::Cyan))),
+                    Line::from(""),
+                    Line::from(Span::styled("    b  *0xADDR  Set breakpoint at address", Style::default().fg(Color::Cyan))),
+                ]);
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "  Press F5 to run, or b to set a breakpoint.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+
+            let msg = Paragraph::new(lines);
             f.render_widget(msg, inner);
             return;
         }
@@ -159,6 +240,28 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
 
             let mut spans = vec![marker, Span::styled(num_str, num_style)];
             spans.extend(text_spans);
+
+            // Show execution flow hit counts in playback mode
+            if view.playback_mode {
+                if let Some(ref flow) = view.exec_flow {
+                    if let Some(ref src) = snap.source {
+                        if let Some(file_hits) = flow.line_hits.get(&src.path) {
+                            if let Some(&count) = file_hits.get(&(line_num as u32)) {
+                                let color = match count {
+                                    1 => Color::DarkGray,
+                                    2..=5 => Color::Yellow,
+                                    _ => Color::Red,
+                                };
+                                spans.push(Span::styled(
+                                    format!(" {count}x"),
+                                    Style::default().fg(color),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
             Line::from(spans)
         })
         .collect();

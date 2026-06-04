@@ -27,7 +27,7 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
     f.render_widget(block, rect);
 
     if snap.locals.is_empty() {
-        let msg = Paragraph::new("No local variables")
+        let msg = Paragraph::new("No local variables in this frame.")
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(msg, inner);
         return;
