@@ -6,16 +6,14 @@ use ratatui::Frame;
 
 use super::super::ViewState;
 
-fn heading(text: &str) -> Line<'_> {
+fn h(text: &str) -> Line<'_> {
     Line::from(Span::styled(
         text,
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
     ))
 }
 
-fn hint(text: &str) -> Line<'_> {
+fn d(text: &str) -> Line<'_> {
     Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
 }
 
@@ -25,223 +23,133 @@ pub fn draw(f: &mut Frame, area: Rect, view: &ViewState) {
 
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
-
     let rect = Rect::new(x, y, width, height);
 
     f.render_widget(Clear, rect);
 
     let block = Block::default()
-        .title(" Help — ? to close, j/k to scroll ")
+        .title(" Help — ? close, j/k scroll ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let help_text = vec![
-        // ---- EXECUTION ----
-        heading("Execution"),
-        Line::from("  F5             Run (if not started) / Continue (if stopped)"),
-        Line::from("  F6             Trace — step line-by-line to next breakpoint"),
-        Line::from("  F7             Step into function call"),
-        Line::from("  F8             Step over (next line, skip function bodies)"),
-        Line::from("  F9             Step out (finish current function)"),
-        Line::from("  Shift+F5       Interrupt (pause a running program)"),
-        Line::from("  Ctrl+X         Interrupt (alternative, works on all terminals)"),
+    let t = vec![
+        h("Execution"),
+        Line::from("  F5             Run / Continue"),
+        Line::from("  F6             Trace to breakpoint (full state each step)"),
+        Line::from("  F7             Step into"),
+        Line::from("  F8             Step over (auto instruction-step if no source)"),
+        Line::from("  F9             Step out"),
+        Line::from("  Shift+F5       Interrupt"),
+        Line::from("  Ctrl+X         Interrupt (works on all terminals)"),
         Line::from(""),
-
-        // ---- GLOBAL NAVIGATION ----
-        heading("Navigation"),
-        Line::from("  j / k          Move selection up / down in focused panel"),
-        Line::from("  g / G          Jump to top / bottom of list"),
-        Line::from("  PgUp / PgDn    Scroll by page"),
-        Line::from("  Enter          Activate selection (panel-specific action)"),
-        Line::from("  Tab            Cycle focus to next panel"),
-        Line::from("  Shift+Tab      Cycle focus to previous panel"),
-        Line::from("  1-9, 0         Toggle panel visibility (number in title)"),
-        Line::from("  Esc            Exit current mode / clear / unfocus"),
+        h("Navigation"),
+        Line::from("  j/k  Up/Down   Move selection"),
+        Line::from("  g / G          Top / bottom"),
+        Line::from("  PgUp/PgDn      Page scroll"),
+        Line::from("  Enter          Activate (panel-specific)"),
+        Line::from("  Tab/Shift+Tab  Cycle panel focus"),
+        Line::from("  1-9, 0         Toggle panel visibility"),
+        Line::from("  Esc            Exit mode / clear / leave panel"),
+        Line::from("  Mouse click    Focus + select. Scroll wheel scrolls"),
         Line::from(""),
-
-        // ---- SOURCE [1] ----
-        heading("[1] Source"),
-        Line::from("  j / k          Move cursor line by line"),
-        Line::from("  Enter          Set breakpoint at cursor line"),
-        Line::from("  F10            Toggle breakpoint at cursor (set or delete)"),
-        Line::from("  .              Jump cursor back to execution line"),
-        Line::from("  /              Search in source text"),
-        Line::from("  n / N          Jump to next / previous search match"),
-        Line::from("  w              Watch identifier on cursor line (prefilled)"),
-        Line::from("  p              Evaluate identifier on cursor line (prefilled)"),
+        h("[1] Source"),
+        Line::from("  Enter          Set breakpoint at cursor"),
+        Line::from("  F10            Toggle breakpoint"),
+        Line::from("  .              Jump to execution line"),
+        Line::from("  /  n/N         Search, next/prev match"),
+        Line::from("  w  p           Watch / eval identifier (prefilled)"),
+        Line::from("  x              Call graph from stack trace"),
         Line::from(""),
-
-        // ---- STACK [2] ----
-        heading("[2] Stack"),
-        Line::from("  Enter          Select frame — source, locals, registers update"),
+        h("[2] Stack"),
+        Line::from("  Enter          Select frame (updates source+locals+disasm)"),
         Line::from(""),
-
-        // ---- LOCALS [3] ----
-        heading("[3] Locals"),
-        Line::from("  w              Watch selected variable (prefilled)"),
-        Line::from("  p              Evaluate selected variable (prefilled)"),
-        Line::from("  m              View variable in memory browser (prefilled)"),
+        h("[3] Locals"),
+        Line::from("  w  p  m        Watch / eval / memory (prefilled)"),
+        d("  Changed values glow red bold"),
         Line::from(""),
-
-        // ---- THREADS [4] ----
-        heading("[4] Threads"),
-        Line::from("  Enter          Switch to selected thread"),
+        h("[4] Threads"),
+        Line::from("  Enter          Switch thread"),
         Line::from(""),
-
-        // ---- BREAKPOINTS [5] ----
-        heading("[5] Breakpoints"),
-        Line::from("  b              Set breakpoint (function, file:line, or *addr)"),
-        Line::from("  B              Conditional breakpoint (location if condition)"),
-        Line::from("  c              Edit condition on selected breakpoint"),
-        Line::from("  W              Set hardware watchpoint (expr [r|w|rw])"),
-        Line::from("  d              Delete selected breakpoint / watchpoint"),
-        Line::from("  e              Enable / disable selected breakpoint"),
-        hint("  Condition syntax:  main.c:42 if x > 100"),
-        hint("  Watchpoint syntax: my_var  |  my_var r  |  my_var rw"),
-        hint("  Address breakpoint: *0x401000"),
+        h("[5] Breakpoints"),
+        Line::from("  b              Breakpoint (func, file:line, *0xaddr)"),
+        Line::from("  B              Conditional (location if condition)"),
+        Line::from("  c              Edit condition on selected"),
+        Line::from("  W              Hardware watchpoint (expr [r|w|rw])"),
+        Line::from("  d  e           Delete / enable-disable"),
         Line::from(""),
-
-        // ---- REGISTERS [6] ----
-        heading("[6] Registers"),
-        Line::from("  E              Edit selected register value"),
-        hint("  Format: name value   (e.g., rax 0x42)"),
-        hint("  Registers auto-load on every stop"),
+        h("[6] Registers"),
+        Line::from("  E              Edit register (name value)"),
+        d("  Auto-loaded every stop. Changed values red bold"),
         Line::from(""),
-
-        // ---- MEMORY [7] ----
-        heading("[7] Memory"),
-        Line::from("  m              Go to address (hex or expression like &my_var)"),
-        Line::from("  Arrows / j/k   Move cursor byte-by-byte / row-by-row"),
-        Line::from("  PgUp / PgDn    Jump by 256 bytes"),
-        Line::from("  Enter          Follow pointer at cursor (read 8 bytes as addr)"),
-        Line::from("  v              Start / extend byte selection"),
-        Line::from("  t              Cycle type cast for selection"),
-        hint("                 hex u8 i8 u16 u32 u64 i16 i32 i64 f32 f64 utf8"),
-        Line::from("  i              Enter hex edit mode (type hex digits to write)"),
-        Line::from("  S              Search memory for string or hex bytes"),
-        Line::from("  Esc            Clear selection / exit edit / leave panel"),
-        hint("  Search syntax: hello world  |  \\x90\\x90\\x90  |  0x41 0x42"),
+        h("[7] Memory"),
+        Line::from("  m              Go to address (hex or &expr)"),
+        Line::from("  Enter          Follow pointer at cursor"),
+        Line::from("  v              Start/extend selection"),
+        Line::from("  t              Cycle type cast (hex u8..u64 f32 f64 utf8)"),
+        Line::from("  i              Hex edit mode"),
+        Line::from("  S              Search (string or \\xHH hex)"),
+        Line::from("  Esc            Clear / exit / leave"),
         Line::from(""),
-
-        // ---- DISASM [8] ----
-        heading("[8] Disassembly"),
-        Line::from("  j / k          Move cursor through instructions"),
-        Line::from("  Enter          Set breakpoint at cursor address"),
-        Line::from("  F10            Toggle breakpoint at cursor address"),
-        Line::from("  x              Analyze cross-references (who calls / what calls)"),
-        Line::from("  s              Resolve symbol at cursor address"),
-        Line::from("  P              NOP out instruction at cursor (x86: 0x90 fill)"),
-        Line::from("  a              Patch raw bytes at cursor address"),
-        hint("  Xrefs shown inline as magenta annotations"),
-        hint("  Colors: red=jump yellow=call green=ret cyan=mem gray=nop"),
+        h("[8] Disassembly"),
+        Line::from("  Enter          Follow call/jump target (else set breakpoint)"),
+        Line::from("  .              Jump cursor to PC"),
+        Line::from("  F10            Toggle breakpoint at address"),
+        Line::from("  x              Cross-references"),
+        Line::from("  s              Resolve symbol"),
+        Line::from("  P              NOP instruction"),
+        Line::from("  a              Patch bytes"),
+        d("  Function boundaries + call targets shown inline"),
+        d("  Colors: red=jump yellow=call green=ret cyan=mem gray=nop"),
         Line::from(""),
-
-        // ---- WATCH [9] ----
-        heading("[9] Watch Expressions"),
-        Line::from("  w              Add watch expression"),
-        Line::from("  d              Remove selected watch"),
-        Line::from("  p              Evaluate selected expression"),
-        Line::from("  m              View in memory browser"),
-        hint("  Expressions re-evaluated automatically on each stop"),
+        h("[9] Watch"),
+        Line::from("  w  d  p  m     Add / remove / eval / memory"),
         Line::from(""),
-
-        // ---- OUTPUT [0] ----
-        heading("[0] Output"),
-        Line::from("  :              Enter raw GDB command"),
-        Line::from("  ;              Repeat last raw command"),
-        hint("  Shows GDB console output, errors, and info messages"),
+        h("[0] Output"),
+        Line::from("  :              Raw GDB command"),
+        Line::from("  ;              Repeat last command"),
         Line::from(""),
-
-        // ---- INSPECTION ----
-        heading("Smart Inspection (auto-prefills from context)"),
-        Line::from("  w              Add watch — prefilled from Source/Locals/Watch"),
-        Line::from("  m              Memory — prefilled with &variable or pointer value"),
-        Line::from("  p              Evaluate — prefilled from focused panel context"),
-        Line::from("  T              Type overlay — cast memory as C struct/type"),
-        hint("  Type overlay:  0xADDR struct name  |  0xADDR int[10]"),
+        h("Inspection (auto-prefills from context)"),
+        Line::from("  w              Watch (Source/Locals/Watch prefill)"),
+        Line::from("  m              Memory (prefills &var or pointer)"),
+        Line::from("  p              Eval (prefills from context)"),
+        Line::from("  T              Type overlay (0xADDR struct name)"),
         Line::from(""),
-
-        // ---- ANALYSIS ----
-        heading("Analysis"),
-        Line::from("  x              Cross-references at disasm cursor"),
-        Line::from("  T              Type overlay on memory (struct field view)"),
-        Line::from("  f              List all known functions"),
+        h("Analysis"),
+        Line::from("  x              Xrefs (Disasm) / call graph (Source/Stack)"),
+        Line::from("  f              List functions (regex filter)"),
         Line::from("  s              Resolve symbol at address"),
-        Line::from("  S              Search memory for string / hex bytes"),
-        Line::from("  L              Show loaded shared libraries"),
+        Line::from("  S              Search memory"),
+        Line::from("  L              Loaded libraries"),
         Line::from(""),
-
-        // ---- PATCHING ----
-        heading("Patching (Disasm panel)"),
+        h("Tracing + Playback"),
+        Line::from("  F6             Trace: frame + locals + registers + disasm each step"),
+        Line::from("  [ / ]          Step backward / forward in history"),
+        Line::from("  < / >          Prev / next breakpoint anchor"),
+        Line::from("  { / }          First / return to live"),
+        Line::from("  R              Toggle recording"),
+        Line::from("  C              Clear recording"),
+        Line::from("  H              Value history (Locals/Registers)"),
+        d("  Hit counts during playback: gray=1x yellow=2-5x red=6+"),
+        Line::from(""),
+        h("Patching"),
         Line::from("  P              NOP instruction at cursor"),
-        Line::from("  a              Write raw bytes at address"),
-        hint("  Patch format:  0xADDR hex_bytes"),
-        hint("  Examples:  0x401000 eb fe   (infinite loop)"),
-        hint("             0x401000 90 90 90  (3x NOP)"),
+        Line::from("  a              Write bytes (0xADDR hex_bytes)"),
         Line::from(""),
-
-        // ---- TRACE / RECORDING ----
-        heading("Execution Tracing"),
-        Line::from("  F6             Trace to breakpoint with full state capture"),
-        hint("  Each step records: frame, locals, registers, disassembly"),
-        hint("  Full stack backtrace captured on final stop"),
-        hint("  Auto instruction-steps when no source line info"),
-        hint("  Cancel with F5 or Ctrl+X"),
+        h("RE Mode (no symbols)"),
+        d("  Auto-switches layout: Disasm+Registers+Memory+Stack+Breakpoints"),
+        d("  Python/Ruby/Java/Node detected -> runtime command hints"),
+        d("  All analysis keys work: x T f s S L P a"),
         Line::from(""),
-        heading("Timeline / Playback"),
-        Line::from("  [  /  ]        Step backward / forward in recorded history"),
-        Line::from("  <  /  >        Jump to previous / next breakpoint anchor"),
-        Line::from("  {  /  }        Jump to first recorded state / return to live"),
-        Line::from("  R              Toggle recording on / off"),
-        Line::from("  C              Clear all recorded states"),
-        hint("  Timeline: \u{00b7} = step  \u{25cf} = breakpoint anchor"),
-        hint("  Colors: Yellow=step  Red=breakpoint  Blue=signal"),
-        hint("  Diff line shows variable changes between states"),
-        Line::from(""),
-
-        // ---- PLAYBACK ANALYSIS ----
-        heading("Playback Analysis"),
-        Line::from("  H              Show value history for selected variable/register"),
-        hint("  Works in Locals or Registers panel during playback mode"),
-        hint("  Scans full recording trace for value changes"),
-        hint("  Results displayed in Output panel with trend analysis"),
-        hint("  Source/Disasm panels show line/address hit counts in playback"),
-        hint("  Colors: gray=1x  yellow=2-5x  red=6+ (hot loop)"),
-        Line::from(""),
-
-        // ---- MOUSE ----
-        heading("Mouse Support"),
-        Line::from("  Left click     Focus panel and select item under cursor"),
-        Line::from("  Scroll up/dn   Scroll focused panel by 3 lines"),
-        hint("  Click Source line to move cursor, Stack frame to select, etc."),
-        Line::from(""),
-
-        // ---- CHANGE HIGHLIGHTING ----
-        heading("Change Highlighting"),
-        hint("  Variables and registers that changed on the last stop"),
-        hint("  are shown in red bold until the next stop event."),
-        hint("  Applies to Locals [3] and Registers [6] panels."),
-        Line::from(""),
-
-        // ---- RE MODE ----
-        heading("Reverse Engineering Mode"),
-        hint("  Auto-activates when no debug symbols detected"),
-        hint("  Layout switches to: Disasm + Registers + Memory + Stack"),
-        hint("  All analysis keys (x, T, f, s, S, L, P, a) work globally"),
-        Line::from(""),
-
-        // ---- GENERAL ----
-        heading("General"),
-        Line::from("  ?  /  F1       Toggle this help (scroll with j/k)"),
-        Line::from("  q              Quit (press y to confirm)"),
+        h("General"),
+        Line::from("  ? / F1         This help (j/k scroll)"),
+        Line::from("  q              Quit (y confirms)"),
     ];
 
-    let paragraph = Paragraph::new(help_text)
+    let paragraph = Paragraph::new(t)
         .scroll((view.help_scroll, 0))
         .wrap(Wrap { trim: false });
-
     f.render_widget(paragraph, inner);
 }
