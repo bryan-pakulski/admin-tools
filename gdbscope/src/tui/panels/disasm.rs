@@ -7,7 +7,6 @@ use ratatui::Frame;
 use crate::state::GdbSnapshot;
 use super::super::ViewState;
 
-/// Classify an instruction mnemonic for color-coding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InsnClass {
     Jump,
@@ -18,25 +17,19 @@ enum InsnClass {
     Other,
 }
 
-/// Classify an instruction string by its mnemonic.
 fn classify_insn(inst: &str) -> InsnClass {
     let mnemonic = inst.split_whitespace().next().unwrap_or("").to_lowercase();
 
-    // Returns
     if matches!(mnemonic.as_str(), "ret" | "retn" | "retf" | "iret" | "iretd" | "iretq"
-        | "sysret" | "sysexit" | "bx" /*ARM bx lr*/) {
+        | "sysret" | "sysexit" | "bx") {
         return InsnClass::Return;
     }
-
-    // Calls
     if mnemonic.starts_with("call") || mnemonic == "bl" || mnemonic == "blx"
         || mnemonic == "blr" || mnemonic == "syscall" || mnemonic == "svc"
     {
         return InsnClass::Call;
     }
-
-    // Jumps / branches (x86 + ARM)
-    if mnemonic.starts_with('j')  // jmp, je, jne, jg, jl, jge, jle, ja, jb, jz, jnz, ...
+    if mnemonic.starts_with('j')
         || (mnemonic.starts_with('b') && matches!(mnemonic.as_str(),
             "b" | "beq" | "bne" | "blt" | "bgt" | "ble" | "bge" | "blo" | "bhi"
             | "bhs" | "bls" | "bpl" | "bmi" | "bvs" | "bvc" | "bcs" | "bcc"
@@ -46,8 +39,6 @@ fn classify_insn(inst: &str) -> InsnClass {
     {
         return InsnClass::Jump;
     }
-
-    // Memory operations
     if matches!(mnemonic.as_str(),
         "mov" | "movl" | "movq" | "movb" | "movw" | "movzx" | "movsx" | "movsxd"
         | "movzbl" | "movzbw" | "movswl" | "movslq" | "movabs"
@@ -63,16 +54,12 @@ fn classify_insn(inst: &str) -> InsnClass {
     ) {
         return InsnClass::Memory;
     }
-
-    // NOP / padding
-    if matches!(mnemonic.as_str(), "nop" | "nopl" | "nopw" | "int3" | "ud2" | "hlt") {
+    if matches!(mnemonic.as_str(), "nop" | "nopl" | "nopw" | "int3" | "ud2" | "hlt" | "endbr64" | "endbr32") {
         return InsnClass::Nop;
     }
-
     InsnClass::Other
 }
 
-/// Get the color for an instruction class.
 fn insn_color(class: InsnClass) -> Color {
     match class {
         InsnClass::Jump => Color::Red,
@@ -84,7 +71,24 @@ fn insn_color(class: InsnClass) -> Color {
     }
 }
 
-/// Draw the disassembly panel.
+/// Extract a call/jump target address from an instruction string.
+pub fn parse_call_target(inst: &str) -> Option<u64> {
+    let class = classify_insn(inst);
+    if !matches!(class, InsnClass::Call | InsnClass::Jump) {
+        return None;
+    }
+    for word in inst.split_whitespace().skip(1) {
+        let clean = word.trim_start_matches("0x").trim_start_matches('*');
+        let hex_part = clean.split(|c: char| !c.is_ascii_hexdigit()).next().unwrap_or(clean);
+        if hex_part.len() >= 4 {
+            if let Ok(addr) = u64::from_str_radix(hex_part, 16) {
+                return Some(addr);
+            }
+        }
+    }
+    None
+}
+
 pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, focused: bool) {
     let border_style = if focused {
         Style::default().fg(Color::Cyan)
@@ -92,8 +96,14 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
         Style::default().fg(Color::DarkGray)
     };
 
+    // Show current function in title if available
+    let func_title = snap.disasm.get(view.disasm_cursor)
+        .and_then(|inst| inst.func_name.as_deref())
+        .map(|name| format!(" [8] Disasm <{name}> "))
+        .unwrap_or_else(|| " [8] Disasm ".to_string());
+
     let block = Block::default()
-        .title(" [8] Disasm ")
+        .title(func_title)
         .borders(Borders::ALL)
         .border_style(border_style);
 
@@ -109,28 +119,22 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
 
     let visible_height = inner.height as usize;
     let total = snap.disasm.len();
-
-    // Clamp cursor
     let cursor = view.disasm_cursor.min(total.saturating_sub(1));
 
-    // Center the cursor in the visible area (like source panel)
     let scroll = if cursor >= visible_height / 2 {
         cursor - visible_height / 2
     } else {
         0
     };
 
-    // Find the current PC address from the top stack frame
     let current_pc = snap.stack.first().map(|fr| fr.addr);
 
-    // Collect breakpoint addresses for gutter marking
     let bp_addrs: std::collections::HashSet<u64> = snap
         .breakpoints
         .iter()
         .filter_map(|bp| bp.address)
         .collect();
 
-    // Build a set of addresses that have xref entries for inline annotation
     let xref_addrs: std::collections::HashMap<u64, Vec<&crate::state::XrefEntry>> = {
         let mut map: std::collections::HashMap<u64, Vec<&crate::state::XrefEntry>> =
             std::collections::HashMap::new();
@@ -150,78 +154,123 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
             let is_current = current_pc == Some(inst.address);
             let is_cursor = idx == cursor;
             let has_bp = bp_addrs.contains(&inst.address);
+            let class = classify_insn(&inst.inst);
 
-            // Gutter: breakpoint marker + PC marker
-            let bp_marker = if has_bp { "\u{25cf}" } else { " " }; // filled circle
+            // Function boundary: show a separator when function changes
+            let prev_func = if idx > 0 {
+                snap.disasm.get(idx - 1).and_then(|i| i.func_name.as_deref())
+            } else {
+                None
+            };
+            let cur_func = inst.func_name.as_deref();
+            let is_func_entry = idx == scroll // first visible line
+                || (cur_func.is_some() && cur_func != prev_func);
+
+            // Gutter
+            let bp_marker = if has_bp { "\u{25cf}" } else { " " };
             let pc_marker = if is_current { "=>" } else { "  " };
-            let gutter = format!("{}{} ", bp_marker, pc_marker);
+            let gutter = format!("{bp_marker}{pc_marker} ");
 
             let bp_style = if has_bp {
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else if is_current {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
 
-            let func_info = match (&inst.func_name, inst.offset) {
-                (Some(name), Some(off)) => format!("<{}+{}>  ", name, off),
-                (Some(name), None) => format!("<{}>  ", name),
-                _ => String::new(),
+            // Function label for entry points
+            let func_label = if is_func_entry {
+                if let (Some(name), Some(0)) | (Some(name), None) = (cur_func, inst.offset) {
+                    format!("<{name}>: ")
+                } else if let Some(name) = cur_func {
+                    if inst.offset == Some(0) {
+                        format!("<{name}>: ")
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
             };
 
-            let class = classify_insn(&inst.inst);
-            let insn_fg = insn_color(class);
-
-            // Build the base style for the instruction
             let insn_style = if is_current {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(insn_fg)
+                Style::default().fg(insn_color(class))
             };
 
             let addr_style = if is_current {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
-            };
-
-            let func_style = if is_current {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Cyan)
             };
 
             let mut spans = vec![
                 Span::styled(gutter, bp_style),
-                Span::styled(format!("{:#018x}  ", inst.address), addr_style),
-                Span::styled(func_info, func_style),
-                Span::styled(inst.inst.clone(), insn_style),
+                Span::styled(format!("{:012x} ", inst.address), addr_style),
             ];
 
-            // Show xref annotations inline if available
+            if !func_label.is_empty() {
+                spans.push(Span::styled(
+                    func_label,
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                ));
+            }
+
+            spans.push(Span::styled(inst.inst.clone(), insn_style));
+
+            // For call instructions, show the target function name
+            if class == InsnClass::Call {
+                if let Some(target_addr) = parse_call_target(&inst.inst) {
+                    let target_name = snap.disasm.iter()
+                        .find(|i| i.address == target_addr)
+                        .and_then(|i| i.func_name.as_deref());
+                    if let Some(name) = target_name {
+                        spans.push(Span::styled(
+                            format!("  ; -> {name}"),
+                            Style::default().fg(Color::Yellow),
+                        ));
+                    }
+                }
+            }
+
+            // Jump target hints for conditional jumps
+            if class == InsnClass::Jump {
+                if let Some(target_addr) = parse_call_target(&inst.inst) {
+                    let direction = if target_addr < inst.address { "\u{2191}" } else { "\u{2193}" };
+                    let offset = if target_addr >= inst.address {
+                        format!("+{:#x}", target_addr - inst.address)
+                    } else {
+                        format!("-{:#x}", inst.address - target_addr)
+                    };
+                    spans.push(Span::styled(
+                        format!("  ; {direction}{offset}"),
+                        Style::default().fg(Color::Red),
+                    ));
+                }
+            }
+
+            // Xref annotations
             if let Some(xrefs) = xref_addrs.get(&inst.address) {
                 let xref_summary: Vec<String> = xrefs.iter().map(|x| {
                     let dir = match x.xref_type {
-                        crate::state::XrefType::CallTo => "\u{2190}",   // left arrow
-                        crate::state::XrefType::CallFrom => "\u{2192}", // right arrow
-                        crate::state::XrefType::JumpTo => "\u{21b5}",   // corner arrow
+                        crate::state::XrefType::CallTo => "\u{2190}",
+                        crate::state::XrefType::CallFrom => "\u{2192}",
+                        crate::state::XrefType::JumpTo => "\u{21b5}",
                     };
                     let name = x.func_name.as_deref().unwrap_or("??");
                     format!("{dir}{name}")
                 }).collect();
-                let annotation = format!("  [{}]", xref_summary.join(", "));
                 spans.push(Span::styled(
-                    annotation,
+                    format!("  [{}]", xref_summary.join(", ")),
                     Style::default().fg(Color::Magenta),
                 ));
             }
 
-            // Show execution flow hit counts in playback mode
+            // Playback hit counts
             if view.playback_mode {
                 if let Some(ref flow) = view.exec_flow {
                     if let Some(&count) = flow.addr_hits.get(&inst.address) {
@@ -238,7 +287,7 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
                 }
             }
 
-            // Apply cursor highlight as a background on the whole line
+            // Cursor highlight
             if is_cursor && focused {
                 for span in &mut spans {
                     span.style = span.style.bg(Color::DarkGray);

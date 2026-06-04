@@ -185,11 +185,10 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
         Panel::Disasm => {
             spans.extend_from_slice(&[
                 sep("| "),
-                key("Enter"), sep(":BrkAtAddr "),
+                key("Enter"), sep(":Follow/Brk "),
+                key("."), sep(":GoPC "),
                 key("F10"), sep(":TogBrk "),
                 key("x"), sep(":Xrefs "),
-                key("s"), sep(":Symbol "),
-                key("T"), sep(":TypeCast "),
                 key("P"), sep(":NOP "),
                 key("a"), sep(":Patch "),
             ]);

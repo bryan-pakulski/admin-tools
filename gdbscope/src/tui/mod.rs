@@ -1200,12 +1200,20 @@ async fn dispatch_action(
                     }
                 }
                 Panel::Disasm => {
-                    // Set breakpoint at cursor address
                     if let Some(inst) = snap.disasm.get(view.disasm_cursor) {
-                        let location = format!("*0x{:x}", inst.address);
-                        let _ = cmd_tx
-                            .send(GdbCommand::SetBreakpoint(location))
-                            .await;
+                        // If cursor is on a call/jump, follow the target
+                        if let Some(target) = panels::disasm::parse_call_target(&inst.inst) {
+                            let _ = cmd_tx
+                                .send(GdbCommand::Disassemble { addr: target.saturating_sub(16), count: 192 })
+                                .await;
+                            view.disasm_cursor = 0;
+                        } else {
+                            // Otherwise set a breakpoint at cursor address
+                            let location = format!("*0x{:x}", inst.address);
+                            let _ = cmd_tx
+                                .send(GdbCommand::SetBreakpoint(location))
+                                .await;
+                        }
                     }
                 }
                 Panel::Memory => {
@@ -1689,10 +1697,26 @@ async fn dispatch_action(
 
         // ---- Source ----
         Action::JumpToExecLine => {
-            let snap = state.load();
-            if let Some(line) = snap.source_line {
-                view.source_cursor = line as usize;
-                view.source_follow_exec = true;
+            if view.focused_panel == Panel::Disasm {
+                // Jump disasm cursor to current PC
+                let snap = state.load();
+                if let Some(pc) = snap.stack.first().map(|f| f.addr) {
+                    if let Some(idx) = snap.disasm.iter().position(|i| i.address == pc) {
+                        view.disasm_cursor = idx;
+                    } else {
+                        // PC not in current disasm window — reload around PC
+                        let _ = cmd_tx
+                            .send(GdbCommand::Disassemble { addr: pc.saturating_sub(64), count: 192 })
+                            .await;
+                        view.disasm_cursor = 0;
+                    }
+                }
+            } else {
+                let snap = state.load();
+                if let Some(line) = snap.source_line {
+                    view.source_cursor = line as usize;
+                    view.source_follow_exec = true;
+                }
             }
         }
         Action::PromptSearch => {

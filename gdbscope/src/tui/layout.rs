@@ -51,7 +51,7 @@ impl Panel {
     pub fn default_visible(self) -> bool {
         matches!(
             self,
-            Panel::Source | Panel::Stack | Panel::Locals | Panel::Breakpoints | Panel::Output
+            Panel::Source | Panel::Stack | Panel::Locals | Panel::Breakpoints
         )
     }
 
@@ -263,7 +263,7 @@ mod tests {
         assert!(Panel::Stack.default_visible());
         assert!(Panel::Locals.default_visible());
         assert!(Panel::Breakpoints.default_visible());
-        assert!(Panel::Output.default_visible());
+        assert!(!Panel::Output.default_visible());
 
         assert!(!Panel::Threads.default_visible());
         assert!(!Panel::Registers.default_visible());
@@ -295,11 +295,8 @@ mod tests {
         assert!(layout.main_area.width > 0);
         assert!(layout.main_area.height > 0);
 
-        // Output should be present since it is default visible
-        assert!(layout.output_area.is_some());
-        let output = layout.output_area.unwrap();
-        assert!(output.width > 0);
-        assert!(output.height > 0);
+        // Output is NOT default visible (toggled with 0)
+        assert!(layout.output_area.is_none());
 
         // Left panels should include Source
         assert!(!layout.left_panels.is_empty());
