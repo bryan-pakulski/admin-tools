@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, Event, KeyEventKind, MouseEvent, MouseEventKind, MouseButton};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -200,6 +200,17 @@ pub struct ViewState {
     // Execution flow analysis
     pub exec_flow: Option<ExecFlowData>,
     pub exec_flow_computed_at: usize,
+
+    // Change highlighting: track which locals/registers changed on last stop
+    pub changed_locals: HashSet<String>,
+    pub changed_registers: HashSet<String>,
+    prev_locals_snap: HashMap<String, String>,
+    prev_registers_snap: HashMap<String, String>,
+    last_target_state: Option<TargetState>,
+
+    // Mouse support: cached panel rects from last layout computation
+    pub last_panel_rects: Vec<(Panel, Rect)>,
+    pub last_output_rect: Option<Rect>,
 }
 
 impl Default for ViewState {
@@ -268,6 +279,15 @@ impl Default for ViewState {
 
             exec_flow: None,
             exec_flow_computed_at: 0,
+
+            changed_locals: HashSet::new(),
+            changed_registers: HashSet::new(),
+            prev_locals_snap: HashMap::new(),
+            prev_registers_snap: HashMap::new(),
+            last_target_state: None,
+
+            last_panel_rects: Vec::new(),
+            last_output_rect: None,
         }
     }
 }
@@ -458,7 +478,7 @@ pub async fn run(
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -468,7 +488,11 @@ pub async fn run(
 
     // Cleanup -- always restore the terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     result
@@ -495,73 +519,132 @@ async fn event_loop(
 
         // Drain all pending crossterm events
         while event::poll(Duration::ZERO)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-
-                // Memory edit mode intercepts hex digit keys
-                if view.input_mode == InputMode::Normal
-                    && view.focused_panel == Panel::Memory
-                    && view.mem_edit
-                {
-                    use crossterm::event::KeyCode;
-                    if let KeyCode::Char(c) = key.code {
-                        if c.is_ascii_hexdigit() {
-                            if dispatch_mem_hex(&mut view, &state, &cmd_tx, c).await {
-                                continue;
-                            }
-                        }
-                    }
-                    if key.code == KeyCode::Esc {
-                        view.mem_edit = false;
-                        view.mem_edit_nibble = None;
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                }
 
-                // Help overlay intercepts all keys when open
-                if view.help_open {
-                    use crossterm::event::KeyCode;
-                    match key.code {
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            view.help_scroll = view.help_scroll.saturating_add(1);
+                    // Memory edit mode intercepts hex digit keys
+                    if view.input_mode == InputMode::Normal
+                        && view.focused_panel == Panel::Memory
+                        && view.mem_edit
+                    {
+                        use crossterm::event::KeyCode;
+                        if let KeyCode::Char(c) = key.code {
+                            if c.is_ascii_hexdigit() {
+                                if dispatch_mem_hex(&mut view, &state, &cmd_tx, c).await {
+                                    continue;
+                                }
+                            }
                         }
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            view.help_scroll = view.help_scroll.saturating_sub(1);
+                        if key.code == KeyCode::Esc {
+                            view.mem_edit = false;
+                            view.mem_edit_nibble = None;
+                            continue;
                         }
-                        KeyCode::PageDown => {
-                            view.help_scroll = view.help_scroll.saturating_add(20);
-                        }
-                        KeyCode::PageUp => {
-                            view.help_scroll = view.help_scroll.saturating_sub(20);
-                        }
-                        KeyCode::Char('g') | KeyCode::Home => {
-                            view.help_scroll = 0;
-                        }
-                        KeyCode::Char('G') | KeyCode::End => {
-                            view.help_scroll = 200; // past the end, clamps in render
-                        }
-                        KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Esc | KeyCode::F(1) => {
-                            view.help_open = false;
-                        }
-                        _ => {}
                     }
-                    continue;
-                }
 
-                let action = match view.input_mode {
-                    InputMode::Normal => input::map_normal(key, view.quit_confirm),
-                    _ => input::map_input(key),
-                };
+                    // Help overlay intercepts all keys when open
+                    if view.help_open {
+                        use crossterm::event::KeyCode;
+                        match key.code {
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                view.help_scroll = view.help_scroll.saturating_add(1);
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                view.help_scroll = view.help_scroll.saturating_sub(1);
+                            }
+                            KeyCode::PageDown => {
+                                view.help_scroll = view.help_scroll.saturating_add(20);
+                            }
+                            KeyCode::PageUp => {
+                                view.help_scroll = view.help_scroll.saturating_sub(20);
+                            }
+                            KeyCode::Char('g') | KeyCode::Home => {
+                                view.help_scroll = 0;
+                            }
+                            KeyCode::Char('G') | KeyCode::End => {
+                                view.help_scroll = 200; // past the end, clamps in render
+                            }
+                            KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Esc | KeyCode::F(1) => {
+                                view.help_open = false;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
 
-                if dispatch_action(action, &mut view, &state, &cmd_tx, &recording).await {
-                    return Ok(());
+                    let action = match view.input_mode {
+                        InputMode::Normal => input::map_normal(key, view.quit_confirm),
+                        _ => input::map_input(key),
+                    };
+
+                    if dispatch_action(action, &mut view, &state, &cmd_tx, &recording).await {
+                        return Ok(());
+                    }
                 }
+                Event::Mouse(mouse) => {
+                    if view.input_mode == InputMode::Normal && !view.help_open {
+                        if let Ok(size) = terminal.size() {
+                            let area = Rect::new(0, 0, size.width, size.height);
+                            let visible = view.visible_panels_ordered();
+                            let show_tl = view.rec_count > 0 || view.playback_mode;
+                            let mouse_layout = layout::compute_with_timeline(area, &visible, show_tl);
+                            handle_mouse_event(mouse, &mut view, &state, &mouse_layout);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
         let live_snap = state.load();
+
+        // Detect stop transitions and compute change highlighting
+        {
+            let cur_state = &live_snap.target_state;
+            let just_stopped = matches!(cur_state, TargetState::Stopped)
+                && !matches!(view.last_target_state.as_ref(), Some(TargetState::Stopped));
+            if just_stopped {
+                // Compare current locals/registers with previous snapshot
+                view.changed_locals.clear();
+                for var in &live_snap.locals {
+                    match view.prev_locals_snap.get(&var.name) {
+                        Some(old_val) if *old_val != var.value => {
+                            view.changed_locals.insert(var.name.clone());
+                        }
+                        None => {
+                            // New variable — also highlight as changed
+                            view.changed_locals.insert(var.name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                view.changed_registers.clear();
+                for reg in &live_snap.registers {
+                    match view.prev_registers_snap.get(&reg.name) {
+                        Some(old_val) if *old_val != reg.value => {
+                            view.changed_registers.insert(reg.name.clone());
+                        }
+                        None => {
+                            view.changed_registers.insert(reg.name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                // Save current values for next comparison
+                view.prev_locals_snap.clear();
+                for var in &live_snap.locals {
+                    view.prev_locals_snap.insert(var.name.clone(), var.value.clone());
+                }
+                view.prev_registers_snap.clear();
+                for reg in &live_snap.registers {
+                    view.prev_registers_snap.insert(reg.name.clone(), reg.value.clone());
+                }
+            }
+            view.last_target_state = Some(cur_state.clone());
+        }
 
         // Sync recording timeline data into ViewState for rendering
         sync_recording_view(&mut view, &recording);
@@ -2013,6 +2096,176 @@ async fn dispatch_action(
     }
 
     false
+}
+
+// ---------------------------------------------------------------------------
+// Mouse handling
+// ---------------------------------------------------------------------------
+
+/// Check if a point (col, row) lies within a Rect.
+fn rect_contains(rect: &Rect, col: u16, row: u16) -> bool {
+    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+/// Handle a mouse event: clicks focus panels and select items, scroll
+/// wheel scrolls the focused panel.
+fn handle_mouse_event(
+    mouse: MouseEvent,
+    view: &mut ViewState,
+    state: &SharedState,
+    panel_layout: &layout::PanelLayout,
+) {
+    let col = mouse.column;
+    let row = mouse.row;
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Check which panel was clicked
+            let all_panels = panel_layout
+                .left_panels
+                .iter()
+                .chain(panel_layout.right_panels.iter());
+
+            for &(panel, rect) in all_panels {
+                if rect_contains(&rect, col, row) {
+                    view.focused_panel = panel;
+                    // Inner area accounting for 1-cell border on each side
+                    let inner_y = row.saturating_sub(rect.y + 1) as usize;
+
+                    match panel {
+                        Panel::Source => {
+                            // Click on a source line: move cursor to that line
+                            let line = view.source_scroll + inner_y + 1;
+                            let snap = state.load();
+                            let line_count = snap.source.as_ref().map_or(0, |s| s.lines.len());
+                            if line_count > 0 {
+                                view.source_cursor = line.min(line_count);
+                                view.source_follow_exec = false;
+                            }
+                        }
+                        Panel::Stack => {
+                            let snap = state.load();
+                            if !snap.stack.is_empty() {
+                                view.stack_selected = inner_y.min(snap.stack.len().saturating_sub(1));
+                            }
+                        }
+                        Panel::Locals => {
+                            let snap = state.load();
+                            if !snap.locals.is_empty() {
+                                view.locals_selected = inner_y.min(snap.locals.len().saturating_sub(1));
+                            }
+                        }
+                        Panel::Threads => {
+                            let snap = state.load();
+                            if !snap.threads.is_empty() {
+                                view.threads_selected = inner_y.min(snap.threads.len().saturating_sub(1));
+                            }
+                        }
+                        Panel::Breakpoints => {
+                            let snap = state.load();
+                            if !snap.breakpoints.is_empty() {
+                                view.breakpoints_selected = inner_y.min(snap.breakpoints.len().saturating_sub(1));
+                            }
+                        }
+                        Panel::Watch => {
+                            let snap = state.load();
+                            if !snap.watch_expressions.is_empty() {
+                                view.watch_selected = inner_y.min(snap.watch_expressions.len().saturating_sub(1));
+                            }
+                        }
+                        Panel::Registers => {
+                            let snap = state.load();
+                            if !snap.registers.is_empty() {
+                                let idx = view.registers_scroll.saturating_add(inner_y);
+                                view.registers_scroll = idx.min(snap.registers.len().saturating_sub(1));
+                            }
+                        }
+                        Panel::Disasm => {
+                            let snap = state.load();
+                            if !snap.disasm.is_empty() {
+                                let idx = view.disasm_scroll.saturating_add(inner_y);
+                                view.disasm_cursor = idx.min(snap.disasm.len().saturating_sub(1));
+                            }
+                        }
+                        Panel::Memory => {
+                            // Click on memory: rough positioning by row
+                            let snap = state.load();
+                            let mem_len = snap.memory.as_ref().map_or(0, |m| m.bytes.len());
+                            if mem_len > 0 {
+                                let byte_offset = inner_y * 16;
+                                view.mem_cursor = byte_offset.min(mem_len.saturating_sub(1));
+                            }
+                        }
+                        Panel::Output => {
+                            // Just focus the panel
+                        }
+                    }
+                    return;
+                }
+            }
+
+            // Check output area
+            if let Some(rect) = panel_layout.output_area {
+                if rect_contains(&rect, col, row) {
+                    view.focused_panel = Panel::Output;
+                    return;
+                }
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            // Scroll the focused panel down
+            let snap = state.load();
+            match view.focused_panel {
+                Panel::Source => {
+                    let line_count = snap.source.as_ref().map_or(0, |s| s.lines.len());
+                    if line_count > 0 {
+                        view.source_cursor = (view.source_cursor + 3).min(line_count);
+                        view.source_follow_exec = false;
+                    }
+                }
+                Panel::Output => {
+                    let count = snap.output.len();
+                    if count > 0 {
+                        view.output_scroll = (view.output_scroll + 3).min(count.saturating_sub(1));
+                    }
+                }
+                Panel::Memory => {
+                    let mem_len = snap.memory.as_ref().map_or(0, |m| m.bytes.len());
+                    if mem_len > 0 {
+                        view.mem_cursor = (view.mem_cursor + 48).min(mem_len.saturating_sub(1));
+                    }
+                }
+                _ => {
+                    let count = view.focused_item_count(&snap);
+                    if count > 0 {
+                        let sel = view.focused_selection_mut();
+                        *sel = (*sel + 3).min(count.saturating_sub(1));
+                    }
+                }
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            // Scroll the focused panel up
+            match view.focused_panel {
+                Panel::Source => {
+                    view.source_cursor = view.source_cursor.saturating_sub(3).max(1);
+                    view.source_follow_exec = false;
+                }
+                Panel::Output => {
+                    view.output_scroll = view.output_scroll.saturating_sub(3);
+                    view.output_follow = false;
+                }
+                Panel::Memory => {
+                    view.mem_cursor = view.mem_cursor.saturating_sub(48);
+                }
+                _ => {
+                    let sel = view.focused_selection_mut();
+                    *sel = sel.saturating_sub(3);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Handle a hex digit keypress in memory edit mode.

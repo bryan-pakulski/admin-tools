@@ -51,6 +51,7 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
         .take(visible_height)
         .map(|(idx, reg)| {
             let is_selected = idx == selected && focused;
+            let is_changed = view.changed_registers.contains(&reg.name);
             if is_selected {
                 let style = Style::default()
                     .fg(Color::Black)
@@ -61,6 +62,13 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
                     style,
                 ))
             } else {
+                let val_style = if is_changed {
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
                 Line::from(vec![
                     Span::styled(
                         format!("{:<width$} ", reg.name, width = max_name),
@@ -68,7 +76,7 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
                     ),
                     Span::styled(
                         reg.value.clone(),
-                        Style::default().fg(Color::White),
+                        val_style,
                     ),
                 ])
             }

@@ -1238,6 +1238,76 @@ impl GdbController {
                                 format!("  {direction}: 0x{:x} <{name}>  {}", xref.address, xref.context),
                             );
                         }
+
+                        // Build ASCII call graph visualization
+                        snap.push_output(OutputKind::Info, String::new());
+                        snap.push_output(
+                            OutputKind::Info,
+                            format!("Call graph for {target_name}:"),
+                        );
+
+                        // Callers (CallTo) — who calls this function
+                        let callers: Vec<_> = xrefs
+                            .iter()
+                            .filter(|x| x.xref_type == XrefType::CallTo)
+                            .collect();
+                        if !callers.is_empty() {
+                            for caller in &callers {
+                                let name = caller.func_name.as_deref().unwrap_or("??");
+                                snap.push_output(
+                                    OutputKind::Console,
+                                    format!("    {name} @ {:#x}", caller.address),
+                                );
+                                snap.push_output(
+                                    OutputKind::Console,
+                                    format!("      \u{2514}\u{2500}> {target_name}"),
+                                );
+                            }
+                        }
+
+                        // Callees (CallFrom) — what this function calls
+                        let callees: Vec<_> = xrefs
+                            .iter()
+                            .filter(|x| x.xref_type == XrefType::CallFrom)
+                            .collect();
+                        if !callees.is_empty() {
+                            snap.push_output(
+                                OutputKind::Console,
+                                format!("    {target_name}"),
+                            );
+                            for (i, callee) in callees.iter().enumerate() {
+                                let name = callee.func_name.as_deref().unwrap_or("??");
+                                let connector = if i == callees.len() - 1 {
+                                    "\u{2514}\u{2500}>"
+                                } else {
+                                    "\u{251c}\u{2500}>"
+                                };
+                                snap.push_output(
+                                    OutputKind::Console,
+                                    format!("      {connector} {name} @ {:#x}", callee.address),
+                                );
+                            }
+                        }
+
+                        // Jump targets
+                        let jumps: Vec<_> = xrefs
+                            .iter()
+                            .filter(|x| x.xref_type == XrefType::JumpTo)
+                            .collect();
+                        if !jumps.is_empty() {
+                            snap.push_output(OutputKind::Info, String::new());
+                            snap.push_output(
+                                OutputKind::Console,
+                                format!("    Jumps to {target_name}:"),
+                            );
+                            for jump in &jumps {
+                                let name = jump.func_name.as_deref().unwrap_or("??");
+                                snap.push_output(
+                                    OutputKind::Console,
+                                    format!("      \u{2514}\u{2500}> from {name} @ {:#x}", jump.address),
+                                );
+                            }
+                        }
                     }
                     snap.xrefs = xrefs;
                 });

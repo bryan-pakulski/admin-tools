@@ -81,8 +81,14 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
                 Style::default().fg(Color::DarkGray)
             };
 
+            let is_changed = view.changed_locals.contains(&var.name);
+
             let val_style = if is_selected && focused {
                 base_style
+            } else if is_changed {
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };

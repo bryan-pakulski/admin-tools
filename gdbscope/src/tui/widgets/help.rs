@@ -212,6 +212,20 @@ pub fn draw(f: &mut Frame, area: Rect, view: &ViewState) {
         hint("  Colors: gray=1x  yellow=2-5x  red=6+ (hot loop)"),
         Line::from(""),
 
+        // ---- MOUSE ----
+        heading("Mouse Support"),
+        Line::from("  Left click     Focus panel and select item under cursor"),
+        Line::from("  Scroll up/dn   Scroll focused panel by 3 lines"),
+        hint("  Click Source line to move cursor, Stack frame to select, etc."),
+        Line::from(""),
+
+        // ---- CHANGE HIGHLIGHTING ----
+        heading("Change Highlighting"),
+        hint("  Variables and registers that changed on the last stop"),
+        hint("  are shown in red bold until the next stop event."),
+        hint("  Applies to Locals [3] and Registers [6] panels."),
+        Line::from(""),
+
         // ---- RE MODE ----
         heading("Reverse Engineering Mode"),
         hint("  Auto-activates when no debug symbols detected"),
