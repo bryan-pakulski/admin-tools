@@ -185,9 +185,10 @@ pub fn draw(f: &mut Frame, area: Rect, view: &ViewState) {
 
         // ---- TRACE / RECORDING ----
         heading("Execution Tracing"),
-        Line::from("  F6             Trace to breakpoint with local variable capture"),
-        hint("  ~120 steps/sec: captures frame info + locals at each step"),
-        hint("  Full stack + registers + disasm captured on final stop"),
+        Line::from("  F6             Trace to breakpoint with full state capture"),
+        hint("  Each step records: frame, locals, registers, disassembly"),
+        hint("  Full stack backtrace captured on final stop"),
+        hint("  Auto instruction-steps when no source line info"),
         hint("  Cancel with F5 or Ctrl+X"),
         Line::from(""),
         heading("Timeline / Playback"),

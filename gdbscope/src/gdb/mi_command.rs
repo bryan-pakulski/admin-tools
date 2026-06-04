@@ -53,16 +53,28 @@ impl MiCommandBuilder {
         (tok, format!("{tok}-exec-continue\n"))
     }
 
-    /// `-exec-step` (step into)
+    /// `-exec-step` (step into — source line)
     pub fn exec_step(&self) -> (u64, String) {
         let tok = self.next();
         (tok, format!("{tok}-exec-step\n"))
     }
 
-    /// `-exec-next` (step over)
+    /// `-exec-step-instruction` (step into — single instruction)
+    pub fn exec_stepi(&self) -> (u64, String) {
+        let tok = self.next();
+        (tok, format!("{tok}-exec-step-instruction\n"))
+    }
+
+    /// `-exec-next` (step over — source line)
     pub fn exec_next(&self) -> (u64, String) {
         let tok = self.next();
         (tok, format!("{tok}-exec-next\n"))
+    }
+
+    /// `-exec-next-instruction` (step over — single instruction)
+    pub fn exec_nexti(&self) -> (u64, String) {
+        let tok = self.next();
+        (tok, format!("{tok}-exec-next-instruction\n"))
     }
 
     /// `-exec-finish` (step out)

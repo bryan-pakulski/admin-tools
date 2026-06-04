@@ -988,17 +988,27 @@ impl GdbController {
                         self.trace_max_steps
                     ));
                 });
-                let (tok, mi) = self.commands.exec_next();
+                let (tok, mi) = self.trace_step_command();
                 self.pending.insert(tok, PendingKind::ExecNext);
                 self.send_raw(&mi).await?;
             }
             GdbCommand::StepOver => {
-                let (tok, mi) = self.commands.exec_next();
+                let has_lines = self.current_frame_has_lines();
+                let (tok, mi) = if has_lines {
+                    self.commands.exec_next()
+                } else {
+                    self.commands.exec_nexti()
+                };
                 self.pending.insert(tok, PendingKind::ExecNext);
                 self.send_raw(&mi).await?;
             }
             GdbCommand::StepInto => {
-                let (tok, mi) = self.commands.exec_step();
+                let has_lines = self.current_frame_has_lines();
+                let (tok, mi) = if has_lines {
+                    self.commands.exec_step()
+                } else {
+                    self.commands.exec_stepi()
+                };
                 self.pending.insert(tok, PendingKind::ExecStep);
                 self.send_raw(&mi).await?;
             }
@@ -1318,20 +1328,45 @@ impl GdbController {
     /// this tracks how many responses are outstanding so we know when to
     /// capture state and issue the next step.
     async fn send_trace_refresh(&mut self) -> Result<()> {
-        // Optimized trace queries: use stack-info-frame (current frame only,
-        // not full backtrace) and simple-values for locals (skip complex
-        // type evaluation). Skip registers — they're captured on final stop.
-        // This gives ~120 steps/sec vs ~25 with full queries.
+        // Per-step trace capture: frame info, locals, registers, disasm.
+        // Uses stack-info-frame (current frame only, not full backtrace)
+        // and --simple-values for locals. Source files are loaded on
+        // demand during playback — no disk I/O here.
 
+        // Current frame info (fast — single frame, not full backtrace)
         let (tok, mi) = self.commands.stack_info_frame();
         self.pending.insert(tok, PendingKind::StackInfoFrame);
         self.send_raw(&mi).await?;
         self.trace_refresh_pending += 1;
 
+        // Local variables (simple values — skips complex type evaluation)
         let (tok, mi) = self.commands.stack_list_locals_simple();
         self.pending.insert(tok, PendingKind::StackListLocalsSimple);
         self.send_raw(&mi).await?;
         self.trace_refresh_pending += 1;
+
+        // Registers
+        if !self.register_names_loaded {
+            let (tok, mi) = self.commands.data_list_register_names();
+            self.pending.insert(tok, PendingKind::RegisterNames);
+            self.send_raw(&mi).await?;
+            self.trace_refresh_pending += 1;
+        }
+        let (tok, mi) = self.commands.data_list_register_values("x");
+        self.pending.insert(tok, PendingKind::RegisterValues);
+        self.send_raw(&mi).await?;
+        self.trace_refresh_pending += 1;
+
+        // Disassembly around current PC
+        let pc = self.state.load().stack.first().map(|f| f.addr).unwrap_or(0);
+        if pc != 0 {
+            let start = pc.saturating_sub(64);
+            let end = pc.saturating_add(128);
+            let (tok, mi) = self.commands.data_disassemble_addr(start, end);
+            self.pending.insert(tok, PendingKind::Disassemble);
+            self.send_raw(&mi).await?;
+            self.trace_refresh_pending += 1;
+        }
 
         Ok(())
     }
@@ -1376,8 +1411,8 @@ impl GdbController {
             return;
         }
 
-        // Issue next step
-        let (tok, mi) = self.commands.exec_next();
+        // Issue next step (instruction-level if no line info)
+        let (tok, mi) = self.trace_step_command();
         self.pending.insert(tok, PendingKind::ExecNext);
         if let Err(e) = self.send_raw(&mi).await {
             warn!("trace auto-step failed: {e:#}");
@@ -1467,6 +1502,26 @@ impl GdbController {
     }
 
     /// Load disassembly around the address of the frame at `level`.
+    /// Pick the right step command for tracing: source-level if we have
+    /// line info, instruction-level otherwise.
+    fn trace_step_command(&self) -> (u64, String) {
+        if self.current_frame_has_lines() {
+            self.commands.exec_next()
+        } else {
+            self.commands.exec_nexti()
+        }
+    }
+
+    /// Check if the current stack frame has source line information.
+    fn current_frame_has_lines(&self) -> bool {
+        let snap = self.state.load();
+        let level = snap.current_frame_level;
+        snap.stack.iter()
+            .find(|f| f.level == level)
+            .or_else(|| snap.stack.first())
+            .map_or(false, |f| f.line.is_some())
+    }
+
     async fn load_disasm_for_frame(&mut self, level: u32) {
         let snap = self.state.load();
         let pc = snap.stack.iter()
