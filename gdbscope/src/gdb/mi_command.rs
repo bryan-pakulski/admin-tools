@@ -379,6 +379,20 @@ impl MiCommandBuilder {
     }
 
     // -----------------------------------------------------------------
+    // Source path configuration
+    // -----------------------------------------------------------------
+
+    /// `directory <path>` -- add a directory to GDB's source search path.
+    pub fn add_source_directory(&self, path: &str) -> (u64, String) {
+        let tok = self.next();
+        let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+        (
+            tok,
+            format!("{tok}-interpreter-exec console \"directory {escaped}\"\n"),
+        )
+    }
+
+    // -----------------------------------------------------------------
     // Raw CLI command via MI
     // -----------------------------------------------------------------
 
@@ -505,5 +519,15 @@ mod tests {
         let b = MiCommandBuilder::new();
         let (tok, cmd) = b.thread_select(3);
         assert_eq!(cmd, format!("{tok}-thread-select 3\n"));
+    }
+
+    #[test]
+    fn add_source_directory_format() {
+        let b = MiCommandBuilder::new();
+        let (tok, cmd) = b.add_source_directory("/home/user/project/src");
+        assert_eq!(
+            cmd,
+            format!("{tok}-interpreter-exec console \"directory /home/user/project/src\"\n")
+        );
     }
 }

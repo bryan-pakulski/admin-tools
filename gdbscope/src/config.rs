@@ -25,6 +25,7 @@ pub struct Config {
     pub record_max: usize,
     pub record_secs: Option<u64>,
     pub trace_depth: usize,
+    pub source_dirs: Vec<String>,
 }
 
 impl Config {
@@ -101,6 +102,7 @@ impl Config {
                 Some(args.record_secs)
             },
             trace_depth: args.trace_depth,
+            source_dirs: args.source_dirs,
         })
     }
 }
@@ -201,6 +203,24 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("not valid with --remote"), "got: {msg}");
+    }
+
+    #[test]
+    fn source_dirs_propagated() {
+        let cfg = Config::from_args(args_from(&[
+            "g", "-e", "./prog",
+            "--source-dir", "/src1",
+            "--source-dir", "/src2",
+        ]))
+        .expect("should succeed");
+        assert_eq!(cfg.source_dirs, vec!["/src1", "/src2"]);
+    }
+
+    #[test]
+    fn source_dirs_empty_by_default() {
+        let cfg = Config::from_args(args_from(&["g", "-p", "1"]))
+            .expect("should succeed");
+        assert!(cfg.source_dirs.is_empty());
     }
 
     #[test]

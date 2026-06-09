@@ -155,6 +155,7 @@ pub struct GdbController {
     trace_refresh_pending: usize, // count of outstanding refresh queries during trace
     trace_is_bp: bool,            // whether the current trace stop was a breakpoint
     exec_args: Vec<String>,
+    source_dirs: Vec<String>,
 }
 
 impl GdbController {
@@ -196,6 +197,7 @@ impl GdbController {
             TargetMode::LaunchExec { args, .. } => args.clone(),
             _ => Vec::new(),
         };
+        let source_dirs = config.source_dirs.clone();
         let handle = tokio::spawn(async move {
             let mut ctrl = GdbController {
                 state,
@@ -218,6 +220,7 @@ impl GdbController {
                 trace_refresh_pending: 0,
                 trace_is_bp: false,
                 exec_args,
+                source_dirs,
             };
             ctrl.initial_setup(&target).await?;
             ctrl.run_loop().await
@@ -231,6 +234,21 @@ impl GdbController {
     // -----------------------------------------------------------------------
 
     async fn initial_setup(&mut self, target: &TargetMode) -> Result<()> {
+        let source_dirs = std::mem::take(&mut self.source_dirs);
+        for dir in &source_dirs {
+            let mut dirs_to_add = vec![dir.clone()];
+            if let Ok(entries) = collect_subdirs(std::path::Path::new(dir)) {
+                dirs_to_add.extend(entries);
+            }
+            for d in &dirs_to_add {
+                let (tok, mi) = self.commands.add_source_directory(d);
+                self.pending.insert(tok, PendingKind::CliCommand);
+                self.send_raw(&mi).await?;
+            }
+            debug!("added source directory: {dir} ({} dirs total)", dirs_to_add.len());
+        }
+        self.source_dirs = source_dirs;
+
         match target {
             TargetMode::AttachPid(_) => {
                 self.update_snapshot(|snap| { snap.source_loading = true; });
@@ -2489,6 +2507,23 @@ fn parse_single_field(s: &str) -> Option<TypeOverlayField> {
     } else {
         None
     }
+}
+
+/// Recursively collect all subdirectory paths under `root`.
+fn collect_subdirs(root: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let mut result = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                let path = entry.path();
+                result.push(path.display().to_string());
+                stack.push(path);
+            }
+        }
+    }
+    Ok(result)
 }
 
 // ===========================================================================

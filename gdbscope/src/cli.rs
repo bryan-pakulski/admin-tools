@@ -9,6 +9,7 @@ use clap::Parser;
         gdbscope -e ./my_program -- arg1 arg2\n  \
         gdbscope -p 12345\n  \
         gdbscope -e ./my_program -c core.1234\n  \
+        gdbscope -e ./my_program -c core.1234 -s /path/to/src\n  \
         gdbscope -r localhost:1234"
 )]
 pub struct Args {
@@ -55,6 +56,10 @@ pub struct Args {
     /// Max steps to capture when trace-continuing (F6) to a breakpoint
     #[arg(long, default_value_t = 500)]
     pub trace_depth: usize,
+
+    /// Add directories to GDB's source file search path (repeatable)
+    #[arg(short = 's', long = "source-dir")]
+    pub source_dirs: Vec<String>,
 }
 
 #[cfg(test)]
@@ -105,5 +110,27 @@ mod tests {
     fn debug_flag() {
         let args = Args::parse_from(["gdbscope", "-p", "1", "--debug"]);
         assert!(args.debug);
+    }
+
+    #[test]
+    fn parse_source_dirs() {
+        let args = Args::parse_from([
+            "gdbscope", "-e", "./prog",
+            "--source-dir", "/path/to/src",
+            "--source-dir", "/another/path",
+        ]);
+        assert_eq!(args.source_dirs, vec!["/path/to/src", "/another/path"]);
+    }
+
+    #[test]
+    fn parse_source_dirs_short() {
+        let args = Args::parse_from(["gdbscope", "-e", "./prog", "-s", "/path/to/src"]);
+        assert_eq!(args.source_dirs, vec!["/path/to/src"]);
+    }
+
+    #[test]
+    fn source_dirs_empty_by_default() {
+        let args = Args::parse_from(["gdbscope", "-p", "1"]);
+        assert!(args.source_dirs.is_empty());
     }
 }
