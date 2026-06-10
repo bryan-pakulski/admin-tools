@@ -52,6 +52,8 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
             InputMode::PatchBytes => "PATCH BYTES",
             InputMode::TypeOverlay => "TYPE OVERLAY",
             InputMode::ListFunctions => "FUNCTIONS",
+            InputMode::Ptype => "PTYPE",
+            InputMode::ExplorerAdd => "EXPLORER",
             InputMode::Normal => unreachable!(),
         };
 
@@ -64,6 +66,8 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
             InputMode::PatchBytes => "  addr hex_bytes  (e.g. 0x401000 90 90)",
             InputMode::TypeOverlay => "  addr type  (e.g. 0x7fff struct foo)",
             InputMode::ListFunctions => "  regex filter (or Enter for all, max 200 shown)",
+            InputMode::Ptype => "  expression or type  (e.g. my_var, MyClass, ptr->member)",
+            InputMode::ExplorerAdd => "  expression  (e.g. my_var, ClassName::singleton, *(Type*)0xaddr)",
             _ => "",
         };
 
@@ -101,6 +105,7 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
                 key("F10"), sep(":TogBrk "),
                 key("w"), sep(":Watch "),
                 key("p"), sep(":Eval "),
+                key("y"), sep(":Ptype "),
                 key("."), sep(":GoExec "),
             ]);
         }
@@ -133,6 +138,7 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
                 key("w"), sep(":Watch "),
                 key("p"), sep(":Eval "),
                 key("m"), sep(":Memory "),
+                key("y"), sep(":Ptype "),
             ]);
             if view.playback_mode {
                 spans.extend_from_slice(&[
@@ -147,6 +153,7 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
                 key("d"), sep(":Del "),
                 key("p"), sep(":Eval "),
                 key("m"), sep(":Memory "),
+                key("y"), sep(":Ptype "),
             ]);
         }
         Panel::Registers => {
@@ -191,6 +198,16 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
                 key("x"), sep(":Xrefs "),
                 key("P"), sep(":NOP "),
                 key("a"), sep(":Patch "),
+            ]);
+        }
+        Panel::Explorer => {
+            spans.extend_from_slice(&[
+                sep("| "),
+                key("Enter"), sep(":Expand "),
+                key("d"), sep(":Remove "),
+                key("I"), sep(":Add "),
+                key("y"), sep(":Ptype "),
+                key("p"), sep(":Eval "),
             ]);
         }
         Panel::Output => {
@@ -261,6 +278,7 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState) {
 
     spans.extend_from_slice(&[
         sep("| "),
+        key("I"), sep(":Explorer "),
         key("f"), sep(":Funcs "),
         key("L"), sep(":Libs "),
         key("S"), sep(":MemSearch "),

@@ -393,6 +393,35 @@ impl MiCommandBuilder {
     }
 
     // -----------------------------------------------------------------
+    // Variable objects (explorer / interactive inspection)
+    // -----------------------------------------------------------------
+
+    /// `-var-create {name} * "{expr}"` — create a var-object for an expression.
+    pub fn var_create(&self, name: &str, expr: &str) -> (u64, String) {
+        let tok = self.next();
+        let escaped = expr.replace('\\', "\\\\").replace('"', "\\\"");
+        (tok, format!("{tok}-var-create {name} * \"{escaped}\"\n"))
+    }
+
+    /// `-var-list-children --all-values {name}` — list children with values.
+    pub fn var_list_children(&self, name: &str) -> (u64, String) {
+        let tok = self.next();
+        (tok, format!("{tok}-var-list-children --all-values {name}\n"))
+    }
+
+    /// `-var-delete {name}` — delete a var-object and its children.
+    pub fn var_delete(&self, name: &str) -> (u64, String) {
+        let tok = self.next();
+        (tok, format!("{tok}-var-delete {name}\n"))
+    }
+
+    /// `-var-update --all-values *` — refresh all var-objects.
+    pub fn var_update_all(&self) -> (u64, String) {
+        let tok = self.next();
+        (tok, format!("{tok}-var-update --all-values *\n"))
+    }
+
+    // -----------------------------------------------------------------
     // Raw CLI command via MI
     // -----------------------------------------------------------------
 

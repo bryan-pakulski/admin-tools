@@ -10,3 +10,4 @@ pub mod watch;
 pub mod output;
 pub mod command;
 pub mod timeline;
+pub mod explorer;

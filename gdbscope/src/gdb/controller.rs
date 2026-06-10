@@ -65,6 +65,16 @@ pub enum GdbCommand {
     ListFunctions(Option<String>),
     /// Resolve an address to the nearest symbol.
     ResolveSymbol(u64),
+    /// Print type definition for an expression or type name.
+    Ptype(String),
+    /// Explorer: add expression as root node.
+    ExplorerAdd(String),
+    /// Explorer: expand node (fetch children via var-list-children).
+    ExplorerExpand(String),
+    /// Explorer: remove root node and its subtree.
+    ExplorerRemove(String),
+    /// Explorer: refresh all var-objects after a stop.
+    ExplorerRefresh,
     RefreshLibraries,
     RawCommand(String),
     Quit,
@@ -116,6 +126,11 @@ enum PendingKind {
     TypeOverlay { addr: u64, type_expr: String },
     ListFunctions,
     ResolveSymbol,
+    Ptype,
+    VarCreate { expr: String },
+    VarListChildren { query_var: String, insert_under: String },
+    VarDelete,
+    VarUpdate,
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +171,8 @@ pub struct GdbController {
     trace_is_bp: bool,            // whether the current trace stop was a breakpoint
     exec_args: Vec<String>,
     source_dirs: Vec<String>,
+    next_explorer_id: u32,
+    warned_missing_libs: bool,
 }
 
 impl GdbController {
@@ -221,6 +238,8 @@ impl GdbController {
                 trace_is_bp: false,
                 exec_args,
                 source_dirs,
+                next_explorer_id: 0,
+                warned_missing_libs: false,
             };
             ctrl.initial_setup(&target).await?;
             ctrl.run_loop().await
@@ -720,6 +739,67 @@ impl GdbController {
             }
             PendingKind::ResolveSymbol => {
                 debug!("info symbol complete (results in console output)");
+            }
+            PendingKind::Ptype => {
+                debug!("ptype complete (results in console output)");
+            }
+            PendingKind::VarCreate { expr } => {
+                let name = MiBody::get_str(body, "name").unwrap_or("").to_string();
+                let numchild: u32 = MiBody::get_str(body, "numchild")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let value = MiBody::get_str(body, "value").unwrap_or("").to_string();
+                let type_name = MiBody::get_str(body, "type").unwrap_or("").to_string();
+
+                if name.is_empty() {
+                    self.update_snapshot(|snap| {
+                        snap.push_output(OutputKind::Error, format!("Explorer: failed to create var-object for '{expr}'"));
+                    });
+                } else {
+                    let has_children = numchild > 0;
+                    let var_name = name.clone();
+                    let node = crate::state::ExplorerNode {
+                        var_name: name,
+                        display_name: expr.clone(),
+                        type_name,
+                        value,
+                        has_children,
+                        expanded: false,
+                        children_loaded: false,
+                        depth: 0,
+                        is_root: true,
+                        changed: false,
+                    };
+                    self.update_snapshot(|snap| {
+                        snap.explorer_nodes.push(node);
+                        snap.push_output(OutputKind::Info, format!("Explorer: added '{expr}'"));
+                    });
+                    if has_children {
+                        let (tok, mi) = self.commands.var_list_children(&var_name);
+                        self.pending.insert(tok, PendingKind::VarListChildren {
+                            query_var: var_name.clone(),
+                            insert_under: var_name,
+                        });
+                        let _ = self.send_raw(&mi).await;
+                    }
+                }
+            }
+            PendingKind::VarListChildren { query_var: _, insert_under } => {
+                let auto_expands = self.process_var_children(body, &insert_under);
+                for ae in auto_expands {
+                    let (tok, mi) = self.commands.var_list_children(&ae.0);
+                    self.pending.insert(tok, PendingKind::VarListChildren {
+                        query_var: ae.0,
+                        insert_under: ae.1,
+                    });
+                    let _ = self.send_raw(&mi).await;
+                }
+            }
+            PendingKind::VarDelete => {
+                debug!("var-delete complete");
+            }
+            PendingKind::VarUpdate => {
+                self.process_var_update(body);
             }
             PendingKind::PatchBytes { addr, byte_count } => {
                 debug!("patch bytes complete at {addr:#x}");
@@ -1353,6 +1433,57 @@ impl GdbController {
                 self.pending.insert(tok, PendingKind::ResolveSymbol);
                 self.send_raw(&mi).await?;
             }
+            GdbCommand::Ptype(expr) => {
+                let (tok, mi) = self.commands.ptype(&expr);
+                self.pending.insert(tok, PendingKind::Ptype);
+                self.send_raw(&mi).await?;
+                self.update_snapshot(|snap| {
+                    snap.push_output(OutputKind::Info, format!("Inspecting type: {expr}"));
+                });
+            }
+            GdbCommand::ExplorerAdd(expr) => {
+                let id = self.next_explorer_id;
+                self.next_explorer_id += 1;
+                let name = format!("exp_{id}");
+                let (tok, mi) = self.commands.var_create(&name, &expr);
+                self.pending.insert(tok, PendingKind::VarCreate { expr });
+                self.send_raw(&mi).await?;
+            }
+            GdbCommand::ExplorerExpand(var_name) => {
+                let (tok, mi) = self.commands.var_list_children(&var_name);
+                self.pending.insert(tok, PendingKind::VarListChildren {
+                    query_var: var_name.clone(),
+                    insert_under: var_name,
+                });
+                self.send_raw(&mi).await?;
+            }
+            GdbCommand::ExplorerRemove(var_name) => {
+                let root_name = var_name.clone();
+                self.update_snapshot(|snap| {
+                    if let Some(pos) = snap.explorer_nodes.iter().position(|n| n.var_name == root_name) {
+                        let root_depth = snap.explorer_nodes[pos].depth;
+                        let mut end = pos + 1;
+                        while end < snap.explorer_nodes.len()
+                            && snap.explorer_nodes[end].depth > root_depth
+                        {
+                            end += 1;
+                        }
+                        snap.explorer_nodes.drain(pos..end);
+                    }
+                });
+                let (tok, mi) = self.commands.var_delete(&var_name);
+                self.pending.insert(tok, PendingKind::VarDelete);
+                self.send_raw(&mi).await?;
+            }
+            GdbCommand::ExplorerRefresh => {
+                let snap = self.state.load();
+                if !snap.explorer_nodes.is_empty() {
+                    let (tok, mi) = self.commands.var_update_all();
+                    self.pending.insert(tok, PendingKind::VarUpdate);
+                    self.send_raw(&mi).await?;
+                }
+                drop(snap);
+            }
             GdbCommand::RefreshLibraries => {
                 let (tok, mi) = self.commands.cli_command("info sharedlibrary");
                 self.pending.insert(tok, PendingKind::CliCommand);
@@ -1544,6 +1675,17 @@ impl GdbController {
             self.send_raw(&mi).await?;
         }
 
+        // Refresh explorer var-objects
+        {
+            let snap = self.state.load();
+            if !snap.explorer_nodes.is_empty() {
+                drop(snap);
+                let (tok, mi) = self.commands.var_update_all();
+                self.pending.insert(tok, PendingKind::VarUpdate);
+                self.send_raw(&mi).await?;
+            }
+        }
+
         Ok(())
     }
 
@@ -1692,12 +1834,30 @@ impl GdbController {
         let current_thread_id = MiBody::get_str(body, "current-thread-id")
             .and_then(|s| s.parse::<i32>().ok());
 
+        let total = threads.len();
+        let unresolved = threads.iter().filter(|t| {
+            t.frame.as_ref().map_or(true, |f| {
+                f.func.as_deref() == Some("??") || (f.func.is_none() && f.file.is_none())
+            })
+        }).count();
+
+        let warn = !self.warned_missing_libs && total >= 4 && unresolved * 2 > total;
+
         self.update_snapshot(|snap| {
             snap.threads = threads;
             if let Some(id) = current_thread_id {
                 snap.current_thread_id = Some(id);
             }
+            if warn {
+                snap.push_output(OutputKind::Info, format!(
+                    "Warning: {unresolved}/{total} threads show '??' — shared libraries likely missing. \
+                     Try: set solib-search-path /path/to/libs  or  set sysroot /path/to/rootfs"
+                ));
+            }
         });
+        if warn {
+            self.warned_missing_libs = true;
+        }
     }
 
     async fn process_stack_list_frames(&mut self, body: &[(String, MiValue)]) {
@@ -1947,6 +2107,136 @@ impl GdbController {
                 );
             }
         });
+    }
+
+    /// Returns Vec of (query_var, insert_under) for auto-expand of synthetic nodes.
+    fn process_var_children(
+        &mut self,
+        body: &[(String, MiValue)],
+        insert_under: &str,
+    ) -> Vec<(String, String)> {
+        let mut children = Vec::new();
+        let mut auto_expands: Vec<(String, String)> = Vec::new();
+
+        if let Some(children_val) = MiBody::get(body, "children") {
+            let child_list = match children_val {
+                MiValue::List(MiList::Results(pairs)) => {
+                    pairs.iter().map(|(_, v)| v).collect::<Vec<_>>()
+                }
+                MiValue::List(MiList::Values(vals)) => vals.iter().collect(),
+                _ => Vec::new(),
+            };
+            for child in child_list {
+                let name = child.get_str("name").unwrap_or("").to_string();
+                let exp = child.get_str("exp").unwrap_or("").to_string();
+                let numchild: u32 = child
+                    .get_str("numchild")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let value = child.get_str("value").unwrap_or("").to_string();
+                let type_name = child.get_str("type").unwrap_or("").to_string();
+
+                if name.is_empty() {
+                    continue;
+                }
+
+                let is_access_spec = matches!(exp.as_str(), "public" | "private" | "protected");
+                if is_access_spec && numchild > 0 {
+                    // Flatten: don't insert this node, auto-expand its children
+                    // directly under the real parent
+                    auto_expands.push((name, insert_under.to_string()));
+                    continue;
+                }
+
+                let is_base_class = numchild > 0 && !type_name.is_empty() && exp == type_name;
+                if is_base_class {
+                    auto_expands.push((name.clone(), name.clone()));
+                }
+
+                children.push(crate::state::ExplorerNode {
+                    var_name: name,
+                    display_name: exp,
+                    type_name,
+                    value,
+                    has_children: numchild > 0,
+                    expanded: is_base_class,
+                    children_loaded: false,
+                    depth: 0, // set below
+                    is_root: false,
+                    changed: false,
+                });
+            }
+        }
+
+        let insert_under_owned = insert_under.to_string();
+        self.update_snapshot(|snap| {
+            if let Some(parent_pos) = snap.explorer_nodes.iter().position(|n| n.var_name == insert_under_owned) {
+                let parent_depth = snap.explorer_nodes[parent_pos].depth;
+                snap.explorer_nodes[parent_pos].expanded = true;
+                snap.explorer_nodes[parent_pos].children_loaded = true;
+
+                for c in &mut children {
+                    c.depth = parent_depth + 1;
+                }
+
+                let mut insert_at = parent_pos + 1;
+                while insert_at < snap.explorer_nodes.len()
+                    && snap.explorer_nodes[insert_at].depth > parent_depth
+                {
+                    insert_at += 1;
+                }
+
+                let count = children.len();
+                snap.explorer_nodes.splice(insert_at..insert_at, children);
+                debug!("Explorer: inserted {count} children for {insert_under_owned}");
+            }
+        });
+
+        auto_expands
+    }
+
+    fn process_var_update(&mut self, body: &[(String, MiValue)]) {
+        if let Some(changelist) = MiBody::get(body, "changelist") {
+            let changes = match changelist {
+                MiValue::List(MiList::Values(vals)) => vals.iter().collect::<Vec<_>>(),
+                MiValue::List(MiList::Results(pairs)) => {
+                    pairs.iter().map(|(_, v)| v).collect()
+                }
+                _ => Vec::new(),
+            };
+
+            if changes.is_empty() {
+                return;
+            }
+
+            let mut updates: Vec<(String, String, bool)> = Vec::new();
+            for change in changes {
+                let name = change.get_str("name").unwrap_or("").to_string();
+                let value = change.get_str("value").unwrap_or("").to_string();
+                let in_scope = change.get_str("in_scope").unwrap_or("true");
+                if !name.is_empty() {
+                    updates.push((name, value, in_scope == "true"));
+                }
+            }
+
+            self.update_snapshot(|snap| {
+                // Clear previous changed flags
+                for node in &mut snap.explorer_nodes {
+                    node.changed = false;
+                }
+                for (name, value, in_scope) in &updates {
+                    if let Some(node) = snap.explorer_nodes.iter_mut().find(|n| n.var_name == *name) {
+                        if *in_scope {
+                            node.value = value.clone();
+                            node.changed = true;
+                        } else {
+                            node.value = "<out of scope>".to_string();
+                            node.changed = true;
+                        }
+                    }
+                }
+            });
+        }
     }
 
     fn process_disassemble(&mut self, body: &[(String, MiValue)]) {

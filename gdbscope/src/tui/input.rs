@@ -43,6 +43,7 @@ pub enum Action {
     PromptWatch,  // w
     PromptMemory, // m
     PromptEval,   // p
+    PromptPtype,  // y
 
     // Command
     PromptCommand,    // :
@@ -112,6 +113,10 @@ pub enum Action {
     PromptListFunctions, // f — list functions (with optional filter)
     ResolveSymbol,     // s — resolve address at disasm cursor to symbol
 
+    // Explorer
+    ToggleExplorer,       // I — toggle explorer panel / add from context
+    PromptExplorerAdd,    // (internal) open prompt to add expression
+
     // Playback analysis
     ShowValueHistory,  // H — show value history for selected variable/register
 }
@@ -133,6 +138,8 @@ pub enum InputMode {
     PatchBytes,
     ListFunctions,
     TypeOverlay,
+    Ptype,
+    ExplorerAdd,
 }
 
 /// Map a key event to an action when in normal (non-input) mode.
@@ -201,6 +208,7 @@ pub fn map_normal(key: KeyEvent, quit_confirm: bool) -> Action {
         KeyCode::Char('w') => Action::PromptWatch,
         KeyCode::Char('m') => Action::PromptMemory,
         KeyCode::Char('p') => Action::PromptEval,
+        KeyCode::Char('y') => Action::PromptPtype,
 
         // ---- Command ----
         KeyCode::Char(':') => Action::PromptCommand,
@@ -235,6 +243,9 @@ pub fn map_normal(key: KeyEvent, quit_confirm: bool) -> Action {
         KeyCode::Char('T') => Action::PromptTypeOverlay,
         KeyCode::Char('f') => Action::PromptListFunctions,
         KeyCode::Char('s') => Action::ResolveSymbol,
+
+        // ---- Explorer ----
+        KeyCode::Char('I') => Action::ToggleExplorer,
 
         // ---- Playback analysis ----
         KeyCode::Char('H') => Action::ShowValueHistory,

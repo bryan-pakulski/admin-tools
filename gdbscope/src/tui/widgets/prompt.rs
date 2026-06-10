@@ -27,6 +27,8 @@ pub fn draw(f: &mut Frame, area: Rect, view: &ViewState) {
         InputMode::PatchBytes => "patch (addr hex) ",
         InputMode::TypeOverlay => "type overlay (addr type) ",
         InputMode::ListFunctions => "functions (filter or Enter for all) ",
+        InputMode::Ptype => "ptype ",
+        InputMode::ExplorerAdd => "explore ",
         InputMode::Normal => return,
     };
 

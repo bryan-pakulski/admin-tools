@@ -170,6 +170,24 @@ pub struct TypeOverlay {
 }
 
 // ---------------------------------------------------------------------------
+// Explorer (interactive object inspector)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct ExplorerNode {
+    pub var_name: String,
+    pub display_name: String,
+    pub type_name: String,
+    pub value: String,
+    pub has_children: bool,
+    pub expanded: bool,
+    pub children_loaded: bool,
+    pub depth: u16,
+    pub is_root: bool,
+    pub changed: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Mapped libraries / shared objects
 // ---------------------------------------------------------------------------
 
@@ -280,6 +298,9 @@ pub struct GdbSnapshot {
     // Watch expressions
     pub watch_expressions: Vec<WatchExpression>,
 
+    // Explorer (interactive type inspector tree)
+    pub explorer_nodes: Vec<ExplorerNode>,
+
     // Mapped libraries / shared objects
     pub mapped_libs: Vec<MappedLibrary>,
 
@@ -322,6 +343,7 @@ impl GdbSnapshot {
             xrefs: Vec::new(),
             type_overlay: None,
             watch_expressions: Vec::new(),
+            explorer_nodes: Vec::new(),
             mapped_libs: Vec::new(),
             source: None,
             source_line: None,

@@ -64,6 +64,7 @@ Number key in `[N]` title toggles panel.
 | `8` | Disasm | off | Disassembly. Instruction coloring, function boundaries, call target annotations, xrefs, patching |
 | `9` | Watch | off | User watch expressions. Re-evaluated each stop |
 | `0` | Output | off | GDB console output, errors, command results |
+| `I` | Explorer | off | Interactive variable drill-down. Tree expansion via GDB var-objects |
 
 No debug symbols detected → auto-switches to **Disasm + Registers + Memory + Stack + Breakpoints**.
 
@@ -128,7 +129,7 @@ Enter selects frame. Source, locals, registers, disasm all update.
 
 ### Locals `[3]`
 
-`w` watch, `p` eval, `m` memory. All prefilled from selected variable. Changed values shown in red bold.
+`w` watch, `p` eval, `m` memory, `y` ptype. All prefilled from selected variable. Changed values shown in red bold.
 
 ### Threads `[4]`
 
@@ -164,11 +165,38 @@ Enter switches thread. Full context updates.
 
 ### Watch `[9]`
 
-`w` add, `d` remove, `p` eval, `m` memory. All prefilled.
+`w` add, `d` remove, `p` eval, `m` memory, `y` ptype. All prefilled.
+
+### Explorer `[I]`
+
+Deep variable inspector. Expand struct members, follow pointers, map out object hierarchies.
+
+| Key | What |
+|-----|------|
+| `I` | Add expression to explorer. From Locals/Watch/Source: prefills selection |
+| `Enter` | Expand / collapse node |
+| `d` | Remove root node + subtree |
+| `y` | Ptype — show full type definition (methods, base classes, operators) |
+| `p` | Eval selected node |
+| `m` | Memory view of selected node |
+
+Accepts any GDB expression: `my_var`, `ClassName::smp_Singleton`, `*(MyType*)0x7fff5000`.
+
+C++ access specifiers (`public`/`private`/`protected`) flattened — members shown directly. Base classes auto-expanded. Values auto-refresh on stop. Changed values glow red.
+
+### Ptype `y`
+
+Show full type definition from any panel. Works on variables (Locals/Watch/Explorer) and types (Source). Output goes to Output panel.
+
+```
+ptype DsSipTransportLayer
+```
+
+Shows class members, methods, operators, base classes, enums. Prefills from context.
 
 ### Smart Inspection
 
-`w`/`p`/`m` auto-prefill from focused panel: Source (identifier on cursor line), Locals (selected variable), Watch (selected expression). Memory prefills with `&variable` or pointer value.
+`w`/`p`/`m`/`y` auto-prefill from focused panel: Source (identifier on cursor line), Locals (selected variable), Watch (selected expression), Explorer (selected node). Memory prefills with `&variable` or pointer value.
 
 ### Analysis
 

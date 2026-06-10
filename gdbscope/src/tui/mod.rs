@@ -146,6 +146,7 @@ pub struct ViewState {
     pub locals_selected: usize,
     pub breakpoints_selected: usize,
     pub registers_scroll: usize,
+    pub explorer_selected: usize,
     pub memory_scroll: usize,
     pub mem_cursor: usize,       // byte offset within the loaded MemoryBlock
     pub mem_sel_start: Option<usize>, // start of selection range (byte offset)
@@ -233,6 +234,7 @@ impl Default for ViewState {
             locals_selected: 0,
             breakpoints_selected: 0,
             registers_scroll: 0,
+            explorer_selected: 0,
             memory_scroll: 0,
             mem_cursor: 0,
             mem_sel_start: None,
@@ -442,6 +444,9 @@ impl ViewState {
                     .map_or(0, |m| (m.bytes.len() + 15) / 16)
             }
             Panel::Disasm => snap.disasm.len(),
+            Panel::Explorer => {
+                panels::explorer::visible_nodes(&snap.explorer_nodes).len()
+            }
         }
     }
 
@@ -459,6 +464,7 @@ impl ViewState {
             Panel::Output => &mut self.output_scroll,
             Panel::Memory => &mut self.memory_scroll,
             Panel::Disasm => &mut self.disasm_cursor,
+            Panel::Explorer => &mut self.explorer_selected,
         }
     }
 }
@@ -965,6 +971,7 @@ fn build_playback_snapshot(rs: &crate::recording::RecordedState) -> GdbSnapshot 
                 error: None,
             })
             .collect(),
+        explorer_nodes: Vec::new(),
         mapped_libs: Vec::new(),
         source: None, // filled in below from live snapshot
         source_line: rs.source_line,
@@ -1098,6 +1105,16 @@ async fn dispatch_action(
                         view.mem_sel_end = Some(view.mem_cursor);
                     }
                 }
+            } else if view.focused_panel == Panel::Explorer {
+                let snap = state.load();
+                let vis = panels::explorer::visible_nodes(&snap.explorer_nodes);
+                if let Some(pos) = vis.iter().position(|&i| i == view.explorer_selected) {
+                    if pos > 0 {
+                        view.explorer_selected = vis[pos - 1];
+                    }
+                } else if let Some(&first) = vis.first() {
+                    view.explorer_selected = first;
+                }
             } else {
                 let snap = state.load();
                 let count = view.focused_item_count(&snap);
@@ -1126,6 +1143,16 @@ async fn dispatch_action(
                     if view.mem_sel_start.is_some() {
                         view.mem_sel_end = Some(view.mem_cursor);
                     }
+                }
+            } else if view.focused_panel == Panel::Explorer {
+                let snap = state.load();
+                let vis = panels::explorer::visible_nodes(&snap.explorer_nodes);
+                if let Some(pos) = vis.iter().position(|&i| i == view.explorer_selected) {
+                    if pos + 1 < vis.len() {
+                        view.explorer_selected = vis[pos + 1];
+                    }
+                } else if let Some(&first) = vis.first() {
+                    view.explorer_selected = first;
                 }
             } else {
                 let snap = state.load();
@@ -1233,6 +1260,43 @@ async fn dispatch_action(
                         }
                     }
                 }
+                Panel::Explorer => {
+                    if let Some(node) = snap.explorer_nodes.get(view.explorer_selected) {
+                        if node.has_children {
+                            if node.expanded {
+                                // Collapse
+                                let var = node.var_name.clone();
+                                drop(snap);
+                                let current = state.load();
+                                let mut new_snap = (**current).clone();
+                                if let Some(n) = new_snap.explorer_nodes.iter_mut()
+                                    .find(|n| n.var_name == var)
+                                {
+                                    n.expanded = false;
+                                }
+                                state.store(Arc::new(new_snap));
+                            } else if node.children_loaded {
+                                // Re-expand (children already in vec)
+                                let var = node.var_name.clone();
+                                drop(snap);
+                                let current = state.load();
+                                let mut new_snap = (**current).clone();
+                                if let Some(n) = new_snap.explorer_nodes.iter_mut()
+                                    .find(|n| n.var_name == var)
+                                {
+                                    n.expanded = true;
+                                }
+                                state.store(Arc::new(new_snap));
+                            } else {
+                                // Fetch children from GDB
+                                let var = node.var_name.clone();
+                                let _ = cmd_tx
+                                    .send(GdbCommand::ExplorerExpand(var))
+                                    .await;
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1335,7 +1399,20 @@ async fn dispatch_action(
         }
         Action::DeleteBreakpoint => {
             let snap = state.load();
-            if view.focused_panel == Panel::Watch {
+            if view.focused_panel == Panel::Explorer {
+                if snap.explorer_nodes.get(view.explorer_selected).is_some() {
+                    // Find the root of this node's subtree
+                    let mut root_idx = view.explorer_selected;
+                    while root_idx > 0 && !snap.explorer_nodes[root_idx].is_root {
+                        root_idx -= 1;
+                    }
+                    let var = snap.explorer_nodes[root_idx].var_name.clone();
+                    let _ = cmd_tx.send(GdbCommand::ExplorerRemove(var)).await;
+                    view.explorer_selected = view.explorer_selected.min(
+                        snap.explorer_nodes.len().saturating_sub(2)
+                    );
+                }
+            } else if view.focused_panel == Panel::Watch {
                 if let Some(w) = snap.watch_expressions.get(view.watch_selected) {
                     let _ = cmd_tx.send(GdbCommand::RemoveWatch(w.id)).await;
                 }
@@ -1370,6 +1447,13 @@ async fn dispatch_action(
             match get_prefill(view, &snap, InputMode::Eval) {
                 Some(prefill) => view.start_input_with(InputMode::Eval, prefill),
                 None => view.start_input(InputMode::Eval),
+            }
+        }
+        Action::PromptPtype => {
+            let snap = state.load();
+            match get_prefill(view, &snap, InputMode::Ptype) {
+                Some(prefill) => view.start_input_with(InputMode::Ptype, prefill),
+                None => view.start_input(InputMode::Ptype),
             }
         }
 
@@ -1446,6 +1530,16 @@ async fn dispatch_action(
                 }
                 InputMode::Eval => {
                     let _ = cmd_tx.send(GdbCommand::EvaluateExpression(buf)).await;
+                }
+                InputMode::Ptype => {
+                    let _ = cmd_tx.send(GdbCommand::Ptype(buf)).await;
+                }
+                InputMode::ExplorerAdd => {
+                    if !buf.is_empty() {
+                        let _ = cmd_tx.send(GdbCommand::ExplorerAdd(buf)).await;
+                        view.panels_visible.insert(Panel::Explorer);
+                        view.focused_panel = Panel::Explorer;
+                    }
                 }
                 InputMode::BreakpointCond => {
                     // Parse: "location if condition" or "location"
@@ -2117,6 +2211,68 @@ async fn dispatch_action(
                 }
             }
         }
+
+        // ---- Explorer ----
+        Action::ToggleExplorer => {
+            match view.focused_panel {
+                Panel::Locals => {
+                    let snap = state.load();
+                    if let Some(var) = snap.locals.get(view.locals_selected) {
+                        let expr = var.name.clone();
+                        let _ = cmd_tx.send(GdbCommand::ExplorerAdd(expr)).await;
+                    }
+                    drop(snap);
+                    view.panels_visible.insert(Panel::Explorer);
+                    view.focused_panel = Panel::Explorer;
+                }
+                Panel::Watch => {
+                    let snap = state.load();
+                    if let Some(w) = snap.watch_expressions.get(view.watch_selected) {
+                        let expr = w.expression.clone();
+                        let _ = cmd_tx.send(GdbCommand::ExplorerAdd(expr)).await;
+                    }
+                    drop(snap);
+                    view.panels_visible.insert(Panel::Explorer);
+                    view.focused_panel = Panel::Explorer;
+                }
+                Panel::Source => {
+                    let snap = state.load();
+                    if let Some(ref src) = snap.source {
+                        if let Some(line_text) = src.lines.get(view.source_cursor.saturating_sub(1)) {
+                            if let Some(ident) = extract_identifier(line_text) {
+                                let _ = cmd_tx.send(GdbCommand::ExplorerAdd(ident)).await;
+                                drop(snap);
+                                view.panels_visible.insert(Panel::Explorer);
+                                view.focused_panel = Panel::Explorer;
+                            }
+                        }
+                    }
+                }
+                Panel::Explorer => {
+                    // Already in explorer — open prompt to add new expression
+                    view.start_input(InputMode::ExplorerAdd);
+                }
+                _ => {
+                    if view.panels_visible.contains(&Panel::Explorer) {
+                        view.panels_visible.remove(&Panel::Explorer);
+                        if view.focused_panel == Panel::Explorer {
+                            view.focused_panel = Panel::Locals;
+                        }
+                    } else {
+                        view.panels_visible.insert(Panel::Explorer);
+                        view.focused_panel = Panel::Explorer;
+                        let snap = state.load();
+                        if snap.explorer_nodes.is_empty() {
+                            drop(snap);
+                            view.start_input(InputMode::ExplorerAdd);
+                        }
+                    }
+                }
+            }
+        }
+        Action::PromptExplorerAdd => {
+            view.start_input(InputMode::ExplorerAdd);
+        }
     }
 
     false
@@ -2222,6 +2378,14 @@ fn handle_mouse_event(
                         }
                         Panel::Output => {
                             // Just focus the panel
+                        }
+                        Panel::Explorer => {
+                            let snap = state.load();
+                            let vis = panels::explorer::visible_nodes(&snap.explorer_nodes);
+                            if !vis.is_empty() {
+                                let click_idx = inner_y.min(vis.len().saturating_sub(1));
+                                view.explorer_selected = vis[click_idx];
+                            }
                         }
                     }
                     return;
@@ -2491,6 +2655,13 @@ fn get_prefill(view: &ViewState, snap: &GdbSnapshot, mode: InputMode) -> Option<
                         Some(format!("&{}", var.name))
                     }
                 }
+                InputMode::Ptype => {
+                    if !var.type_name.is_empty() {
+                        Some(var.type_name.clone())
+                    } else {
+                        Some(var.name.clone())
+                    }
+                }
                 _ => Some(var.name.clone()),
             }
         }
@@ -2514,6 +2685,26 @@ fn get_prefill(view: &ViewState, snap: &GdbSnapshot, mode: InputMode) -> Option<
             match mode {
                 InputMode::Memory => Some(format!("&{ident}")),
                 _ => Some(ident),
+            }
+        }
+        Panel::Explorer => {
+            let node = snap.explorer_nodes.get(view.explorer_selected)?;
+            match mode {
+                InputMode::Ptype => {
+                    if !node.type_name.is_empty() {
+                        Some(node.type_name.clone())
+                    } else {
+                        Some(node.display_name.clone())
+                    }
+                }
+                InputMode::Memory => {
+                    if node.value.starts_with("0x") {
+                        Some(node.value.clone())
+                    } else {
+                        Some(node.display_name.clone())
+                    }
+                }
+                _ => Some(node.display_name.clone()),
             }
         }
         _ => None,
@@ -2676,5 +2867,6 @@ fn draw_panel(
         Panel::Disasm => panels::disasm::draw(f, rect, snap, view, focused),
         Panel::Watch => panels::watch::draw(f, rect, snap, view, focused),
         Panel::Output => panels::output::draw(f, rect, snap, view),
+        Panel::Explorer => panels::explorer::draw(f, rect, snap, view, focused),
     }
 }

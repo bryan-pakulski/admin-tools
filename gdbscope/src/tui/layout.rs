@@ -12,6 +12,7 @@ pub enum Panel {
     Disasm,
     Watch,
     Output,
+    Explorer,
 }
 
 impl Panel {
@@ -28,6 +29,7 @@ impl Panel {
             Panel::Disasm => "Disasm",
             Panel::Watch => "Watch",
             Panel::Output => "Output",
+            Panel::Explorer => "Explorer",
         }
     }
 
@@ -44,6 +46,7 @@ impl Panel {
             Panel::Disasm => "8",
             Panel::Watch => "9",
             Panel::Output => "0",
+            Panel::Explorer => "I",
         }
     }
 
@@ -53,6 +56,11 @@ impl Panel {
             self,
             Panel::Source | Panel::Stack | Panel::Locals | Panel::Breakpoints
         )
+    }
+
+    /// Whether this panel is toggled via a letter key rather than a number key.
+    pub fn is_letter_toggle(self) -> bool {
+        matches!(self, Panel::Explorer)
     }
 
     /// All panel variants in canonical order.
@@ -68,6 +76,7 @@ impl Panel {
             Panel::Disasm,
             Panel::Watch,
             Panel::Output,
+            Panel::Explorer,
         ]
     }
 
@@ -253,8 +262,8 @@ mod tests {
     }
 
     #[test]
-    fn panel_all_returns_10_panels() {
-        assert_eq!(Panel::all().len(), 10);
+    fn panel_all_returns_11_panels() {
+        assert_eq!(Panel::all().len(), 11);
     }
 
     #[test]
