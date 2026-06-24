@@ -10,7 +10,12 @@ use clap::Parser;
         gdbscope -p 12345\n  \
         gdbscope -e ./my_program -c core.1234\n  \
         gdbscope -e ./my_program -c core.1234 -s /path/to/src\n  \
-        gdbscope -r localhost:1234"
+        gdbscope -r localhost:1234\n\n  \
+        Off-site core dump analysis (different OS/glibc):\n  \
+        gdbscope-collect -e /opt/app/server -c /var/cores/core.123\n  \
+        scp coredump-server-*.tar.gz devbox:~/\n  \
+        tar xf coredump-server-*.tar.gz\n  \
+        gdbscope -e sysroot/opt/app/server -c sysroot/core.123 --sysroot sysroot"
 )]
 pub struct Args {
     /// Attach to a running process by PID
@@ -60,6 +65,11 @@ pub struct Args {
     /// Add directories to GDB's source file search path (repeatable)
     #[arg(short = 's', long = "source-dir")]
     pub source_dirs: Vec<String>,
+
+    /// Set GDB sysroot for resolving shared libraries from a different system
+    /// (e.g. analysing a CentOS 7 core dump on an OL9 dev machine)
+    #[arg(long)]
+    pub sysroot: Option<String>,
 }
 
 #[cfg(test)]
@@ -132,5 +142,17 @@ mod tests {
     fn source_dirs_empty_by_default() {
         let args = Args::parse_from(["gdbscope", "-p", "1"]);
         assert!(args.source_dirs.is_empty());
+    }
+
+    #[test]
+    fn parse_sysroot() {
+        let args = Args::parse_from(["gdbscope", "-e", "./prog", "-c", "core.1", "--sysroot", "/tmp/sysroot"]);
+        assert_eq!(args.sysroot.as_deref(), Some("/tmp/sysroot"));
+    }
+
+    #[test]
+    fn sysroot_none_by_default() {
+        let args = Args::parse_from(["gdbscope", "-p", "1"]);
+        assert!(args.sysroot.is_none());
     }
 }

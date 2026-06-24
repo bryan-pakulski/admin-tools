@@ -26,6 +26,7 @@ pub struct Config {
     pub record_secs: Option<u64>,
     pub trace_depth: usize,
     pub source_dirs: Vec<String>,
+    pub sysroot: Option<String>,
 }
 
 impl Config {
@@ -103,6 +104,7 @@ impl Config {
             },
             trace_depth: args.trace_depth,
             source_dirs: args.source_dirs,
+            sysroot: args.sysroot,
         })
     }
 }
@@ -229,6 +231,22 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("redraw-hz"), "got: {msg}");
+    }
+
+    #[test]
+    fn sysroot_propagated() {
+        let cfg = Config::from_args(args_from(&[
+            "g", "-e", "./prog", "-c", "core.1", "--sysroot", "/mnt/sysroot",
+        ]))
+        .expect("should succeed");
+        assert_eq!(cfg.sysroot.as_deref(), Some("/mnt/sysroot"));
+    }
+
+    #[test]
+    fn sysroot_none_by_default() {
+        let cfg = Config::from_args(args_from(&["g", "-p", "1"]))
+            .expect("should succeed");
+        assert!(cfg.sysroot.is_none());
     }
 
     #[test]

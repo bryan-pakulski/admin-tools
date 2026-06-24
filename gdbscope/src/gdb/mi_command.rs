@@ -382,6 +382,16 @@ impl MiCommandBuilder {
     // Source path configuration
     // -----------------------------------------------------------------
 
+    /// `set sysroot <path>` -- set the root for resolving shared libraries.
+    pub fn set_sysroot(&self, path: &str) -> (u64, String) {
+        let tok = self.next();
+        let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+        (
+            tok,
+            format!("{tok}-interpreter-exec console \"set sysroot {escaped}\"\n"),
+        )
+    }
+
     /// `directory <path>` -- add a directory to GDB's source search path.
     pub fn add_source_directory(&self, path: &str) -> (u64, String) {
         let tok = self.next();

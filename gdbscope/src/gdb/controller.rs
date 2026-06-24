@@ -171,6 +171,7 @@ pub struct GdbController {
     trace_is_bp: bool,            // whether the current trace stop was a breakpoint
     exec_args: Vec<String>,
     source_dirs: Vec<String>,
+    sysroot: Option<String>,
     next_explorer_id: u32,
     warned_missing_libs: bool,
 }
@@ -215,6 +216,7 @@ impl GdbController {
             _ => Vec::new(),
         };
         let source_dirs = config.source_dirs.clone();
+        let sysroot = config.sysroot.clone();
         let handle = tokio::spawn(async move {
             let mut ctrl = GdbController {
                 state,
@@ -238,6 +240,7 @@ impl GdbController {
                 trace_is_bp: false,
                 exec_args,
                 source_dirs,
+                sysroot,
                 next_explorer_id: 0,
                 warned_missing_libs: false,
             };
@@ -253,6 +256,13 @@ impl GdbController {
     // -----------------------------------------------------------------------
 
     async fn initial_setup(&mut self, target: &TargetMode) -> Result<()> {
+        if let Some(sysroot) = self.sysroot.clone() {
+            let (tok, mi) = self.commands.set_sysroot(&sysroot);
+            self.pending.insert(tok, PendingKind::CliCommand);
+            self.send_raw(&mi).await?;
+            debug!("set sysroot: {sysroot}");
+        }
+
         let source_dirs = std::mem::take(&mut self.source_dirs);
         for dir in &source_dirs {
             let mut dirs_to_add = vec![dir.clone()];
@@ -1851,7 +1861,7 @@ impl GdbController {
             if warn {
                 snap.push_output(OutputKind::Info, format!(
                     "Warning: {unresolved}/{total} threads show '??' — shared libraries likely missing. \
-                     Try: set solib-search-path /path/to/libs  or  set sysroot /path/to/rootfs"
+                     Try: gdbscope --sysroot /path/to/rootfs  (use gdbscope-collect on the target machine to create one)"
                 ));
             }
         });

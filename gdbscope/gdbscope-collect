@@ -1,0 +1,178 @@
+#!/bin/bash
+#
+# gdbscope-collect — bundle a core dump with its executable and all shared
+# libraries into a portable tarball for off-site analysis.
+#
+# Run this on the machine where the core dump was produced. The output tarball
+# can be copied to a dev machine and analysed with:
+#
+#   tar xf coredump-<name>-<ts>.tar.gz
+#   gdbscope -e <sysroot>/path/to/executable -c <sysroot>/path/to/core \
+#            --sysroot <sysroot>
+#
+# Usage:
+#   gdbscope-collect -e /path/to/executable -c /path/to/core
+#   gdbscope-collect -e /path/to/executable -c /path/to/core -o bundle.tar.gz
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: gdbscope-collect -e EXECUTABLE -c COREFILE [-o OUTPUT]
+
+Bundle a core dump with its executable and all shared libraries into a
+portable tarball for off-site analysis with gdbscope --sysroot.
+
+Options:
+  -e EXECUTABLE   Path to the executable that produced the core dump
+  -c COREFILE     Path to the core dump file
+  -o OUTPUT       Output tarball path (default: coredump-<name>-<timestamp>.tar.gz)
+  -h              Show this help
+
+Example:
+  gdbscope-collect -e /opt/app/myserver -c /var/cores/core.12345
+  scp coredump-myserver-20260624.tar.gz dev-machine:~/
+
+  # On the dev machine:
+  tar xf coredump-myserver-20260624.tar.gz
+  gdbscope -e sysroot/opt/app/myserver -c sysroot/core.12345 --sysroot sysroot
+EOF
+    exit "${1:-0}"
+}
+
+EXECUTABLE=""
+COREFILE=""
+OUTPUT=""
+
+while getopts "e:c:o:h" opt; do
+    case "$opt" in
+        e) EXECUTABLE="$OPTARG" ;;
+        c) COREFILE="$OPTARG" ;;
+        o) OUTPUT="$OPTARG" ;;
+        h) usage 0 ;;
+        *) usage 1 ;;
+    esac
+done
+
+if [[ -z "$EXECUTABLE" || -z "$COREFILE" ]]; then
+    echo "Error: both -e EXECUTABLE and -c COREFILE are required" >&2
+    usage 1
+fi
+
+if [[ ! -f "$EXECUTABLE" ]]; then
+    echo "Error: executable not found: $EXECUTABLE" >&2
+    exit 1
+fi
+
+if [[ ! -f "$COREFILE" ]]; then
+    echo "Error: core file not found: $COREFILE" >&2
+    exit 1
+fi
+
+# Default output name
+if [[ -z "$OUTPUT" ]]; then
+    basename=$(basename "$EXECUTABLE")
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    OUTPUT="coredump-${basename}-${timestamp}.tar.gz"
+fi
+
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+SYSROOT="$TMPDIR/sysroot"
+mkdir -p "$SYSROOT"
+
+# Copy the executable, preserving its absolute path under the sysroot
+exe_abs=$(readlink -f "$EXECUTABLE")
+exe_dir=$(dirname "$exe_abs")
+mkdir -p "$SYSROOT/$exe_dir"
+cp "$exe_abs" "$SYSROOT/$exe_abs"
+echo "Collected: $exe_abs"
+
+# Copy the core file into the sysroot root
+core_abs=$(readlink -f "$COREFILE")
+cp "$core_abs" "$SYSROOT/$(basename "$core_abs")"
+echo "Collected: $core_abs"
+
+# Extract shared library paths from the core dump via ldd or eu-readelf
+collect_libs() {
+    # Method 1: ldd (works on the live executable)
+    if command -v ldd &>/dev/null; then
+        ldd "$exe_abs" 2>/dev/null | awk '/=>/ {print $3}' | grep -v 'not found' || true
+    fi
+
+    # Method 2: read the core file's shared library list
+    if command -v eu-readelf &>/dev/null; then
+        eu-readelf -n "$core_abs" 2>/dev/null \
+            | grep -oP '/\S+\.so[.\d]*' || true
+    elif command -v readelf &>/dev/null; then
+        readelf -n "$core_abs" 2>/dev/null \
+            | grep -oP '/\S+\.so[.\d]*' || true
+    fi
+
+    # Method 3: GDB's shared library list (most reliable for core dumps)
+    if command -v gdb &>/dev/null; then
+        gdb -batch -ex "set sysroot /" -ex "info shared" \
+            "$exe_abs" "$core_abs" 2>/dev/null \
+            | awk '/^0x/ || /^\t/ {print $NF}' \
+            | grep '/' || true
+    fi
+}
+
+# Collect unique library paths
+libs=$(collect_libs | sort -u)
+
+# Copy each library, preserving its absolute path
+for lib in $libs; do
+    if [[ -f "$lib" ]]; then
+        lib_real=$(readlink -f "$lib")
+        lib_dir=$(dirname "$lib")
+        mkdir -p "$SYSROOT/$lib_dir"
+
+        # Copy the actual file
+        if [[ ! -f "$SYSROOT/$lib_real" ]]; then
+            mkdir -p "$SYSROOT/$(dirname "$lib_real")"
+            cp "$lib_real" "$SYSROOT/$lib_real"
+        fi
+
+        # Preserve symlink structure
+        if [[ "$lib" != "$lib_real" && ! -e "$SYSROOT/$lib" ]]; then
+            ln -sf "$lib_real" "$SYSROOT/$lib"
+        fi
+
+        echo "Collected: $lib"
+    fi
+done
+
+# Also grab the dynamic linker
+for ld in /lib64/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2 /lib/ld-linux.so.2; do
+    if [[ -f "$ld" ]]; then
+        ld_real=$(readlink -f "$ld")
+        mkdir -p "$SYSROOT/$(dirname "$ld")"
+        if [[ ! -f "$SYSROOT/$ld_real" ]]; then
+            mkdir -p "$SYSROOT/$(dirname "$ld_real")"
+            cp "$ld_real" "$SYSROOT/$ld_real"
+        fi
+        if [[ "$ld" != "$ld_real" && ! -e "$SYSROOT/$ld" ]]; then
+            ln -sf "$ld_real" "$SYSROOT/$ld"
+        fi
+        echo "Collected: $ld"
+    fi
+done
+
+# Count what we collected
+lib_count=$(find "$SYSROOT" -name '*.so*' -type f | wc -l)
+total_size=$(du -sh "$SYSROOT" | cut -f1)
+
+echo ""
+echo "Bundled $lib_count libraries ($total_size total)"
+
+# Create the tarball
+tar czf "$OUTPUT" -C "$TMPDIR" sysroot
+
+final_size=$(du -sh "$OUTPUT" | cut -f1)
+echo "Created: $OUTPUT ($final_size)"
+echo ""
+echo "To analyse on your dev machine:"
+echo "  tar xf $OUTPUT"
+echo "  gdbscope -e sysroot${exe_abs} -c sysroot/$(basename "$core_abs") --sysroot sysroot"
