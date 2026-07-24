@@ -70,6 +70,13 @@ pub struct Args {
     /// (e.g. analysing a CentOS 7 core dump on an OL9 dev machine)
     #[arg(long)]
     pub sysroot: Option<String>,
+
+    /// Path to CPython's gdb helper script (libpython.py / pythonX.Y-gdb.py) to
+    /// `source` at startup, defining py-bt/py-list/py-locals for the Python
+    /// view. Use this when the helper isn't auto-loaded (e.g. no debuginfo
+    /// installed, or a non-standard Python location).
+    #[arg(long = "python-gdb")]
+    pub python_gdb: Option<String>,
 }
 
 #[cfg(test)]

@@ -76,7 +76,17 @@ pub enum GdbCommand {
     /// Explorer: refresh all var-objects after a stop.
     ExplorerRefresh,
     RefreshLibraries,
+    /// Walk a std::list and populate Explorer with each element.
+    Walk { expr: String, cast_type: Option<String> },
+    /// Walk a raw pointer chain (manual start/end addresses).
+    WalkRaw { start_addr: String, end_addr: String, cast_type: String },
     RawCommand(String),
+    /// Toggle between the Python-level view and the native (C) view.
+    TogglePythonMode,
+    /// Select a Python stack frame (drives py-up / py-down).
+    SelectPythonFrame { level: u32 },
+    /// Re-run the Python py-bt/py-list/py-locals cascade.
+    RefreshPython,
     Quit,
 }
 
@@ -127,10 +137,48 @@ enum PendingKind {
     ListFunctions,
     ResolveSymbol,
     Ptype,
-    VarCreate { expr: String },
+    VarCreate { expr: String, display_name: Option<String> },
     VarListChildren { query_var: String, insert_under: String },
     VarDelete,
     VarUpdate,
+    WalkDetectType { expr: String },
+    WalkSentinel { expr: String },
+    WalkFirst,
+    WalkNext,
+    // CPython python-gdb.py helper commands (console output captured).
+    PyBacktrace,
+    PyList,
+    PyLocals,
+    PyNavigate,
+}
+
+// ---------------------------------------------------------------------------
+// Python (CPython) integration state
+// ---------------------------------------------------------------------------
+
+/// Which py-* command's console output the active capture belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PyCaptureKind {
+    Backtrace,
+    List,
+    Locals,
+}
+
+/// Accumulates console stream records (`~"..."`) emitted by a py-* command
+/// while it is in flight, since console records are not token-tagged.
+#[derive(Debug)]
+struct ConsoleCapture {
+    token: u64,
+    kind: PyCaptureKind,
+    lines: Vec<String>,
+}
+
+/// In-progress py-up / py-down navigation to a target Python frame level.
+#[derive(Debug)]
+struct PyNavState {
+    remaining: u32,
+    going_up: bool,
+    target_level: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +189,20 @@ enum PendingKind {
 struct WatchEntry {
     id: u32,
     expression: String,
+}
+
+// ---------------------------------------------------------------------------
+// WalkState -- state for the :walk linked-list walker
+// ---------------------------------------------------------------------------
+
+const WALK_MAX_ELEMENTS: usize = 10_000;
+
+#[derive(Debug)]
+struct WalkState {
+    sentinel_addr: u64,
+    element_type: String,
+    node_addrs: Vec<u64>,
+    populate_index: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,8 +234,16 @@ pub struct GdbController {
     exec_args: Vec<String>,
     source_dirs: Vec<String>,
     sysroot: Option<String>,
+    python_gdb: Option<String>,
     next_explorer_id: u32,
     warned_missing_libs: bool,
+    walk_state: Option<WalkState>,
+    // Python (CPython) integration
+    console_capture: Option<ConsoleCapture>,
+    python_forced_native: bool,      // user explicitly toggled to the C view
+    python_probe_failed: bool,       // py-bt failed (helpers not loaded)
+    py_nav: Option<PyNavState>,      // in-progress py-up/py-down navigation
+    py_bt_src: HashMap<u32, String>, // level -> source-line text from py-bt (fallback)
 }
 
 impl GdbController {
@@ -217,6 +287,7 @@ impl GdbController {
         };
         let source_dirs = config.source_dirs.clone();
         let sysroot = config.sysroot.clone();
+        let python_gdb = config.python_gdb.clone();
         let handle = tokio::spawn(async move {
             let mut ctrl = GdbController {
                 state,
@@ -241,8 +312,15 @@ impl GdbController {
                 exec_args,
                 source_dirs,
                 sysroot,
+                python_gdb,
                 next_explorer_id: 0,
                 warned_missing_libs: false,
+                walk_state: None,
+                console_capture: None,
+                python_forced_native: false,
+                python_probe_failed: false,
+                py_nav: None,
+                py_bt_src: HashMap::new(),
             };
             ctrl.initial_setup(&target).await?;
             ctrl.run_loop().await
@@ -261,6 +339,44 @@ impl GdbController {
             self.pending.insert(tok, PendingKind::CliCommand);
             self.send_raw(&mi).await?;
             debug!("set sysroot: {sysroot}");
+
+            // Also search for separate debuginfo inside the sysroot bundle
+            // (as produced by gdbscope-collect), then the host's default. This
+            // is what lets a self-contained bundle resolve symbols and language
+            // helpers (e.g. CPython's py-bt) without matching debuginfo being
+            // installed locally.
+            let root = sysroot.trim_end_matches('/');
+            let cmd = format!(
+                "set debug-file-directory {root}/usr/lib/debug:/usr/lib/debug"
+            );
+            let (tok, mi) = self.commands.cli_command(&cmd);
+            self.pending.insert(tok, PendingKind::CliCommand);
+            self.send_raw(&mi).await?;
+            debug!("set debug-file-directory under sysroot: {root}/usr/lib/debug");
+        }
+
+        // Source an explicit CPython gdb helper if the user pointed us at one.
+        // This defines py-bt/py-list/py-locals when they aren't auto-loaded.
+        if let Some(path) = self.python_gdb.clone() {
+            if std::path::Path::new(&path).exists() {
+                let (tok, mi) = self.commands.cli_command(&format!("source {path}"));
+                self.pending.insert(tok, PendingKind::CliCommand);
+                self.send_raw(&mi).await?;
+                self.update_snapshot(|s| {
+                    s.push_output(
+                        OutputKind::Info,
+                        format!("Sourced Python gdb helper: {path}"),
+                    );
+                });
+                debug!("sourced python gdb helper: {path}");
+            } else {
+                self.update_snapshot(|s| {
+                    s.push_output(
+                        OutputKind::Error,
+                        format!("--python-gdb path not found: {path}"),
+                    );
+                });
+            }
         }
 
         let source_dirs = std::mem::take(&mut self.source_dirs);
@@ -425,6 +541,11 @@ impl GdbController {
                 debug!("async status: {class}");
             }
             MiRecord::StreamConsole(text) => {
+                // If a py-* command is in flight, capture its console output for
+                // parsing.  Always mirror to the Output panel as well.
+                if let Some(cap) = self.console_capture.as_mut() {
+                    cap.lines.push(text.clone());
+                }
                 self.update_snapshot(|snap| {
                     snap.push_output(OutputKind::Console, text);
                 });
@@ -487,6 +608,84 @@ impl GdbController {
                             w.error = Some(err_msg);
                         }
                     });
+                }
+
+                // Walk errors: clean up state and give actionable message
+                if let Some(ref kind) = kind {
+                    let is_walk = matches!(
+                        kind,
+                        PendingKind::WalkDetectType { .. }
+                        | PendingKind::WalkSentinel { .. }
+                        | PendingKind::WalkFirst
+                        | PendingKind::WalkNext
+                    );
+                    if is_walk {
+                        let count = self.walk_state.as_ref()
+                            .map(|ws| ws.node_addrs.len())
+                            .unwrap_or(0);
+                        if count > 0 {
+                            self.update_snapshot(|snap| {
+                                snap.push_output(
+                                    OutputKind::Info,
+                                    format!("Walk: error after {count} elements, populating with what we have"),
+                                );
+                            });
+                            self.walk_start_populate().await;
+                        } else {
+                            self.update_snapshot(|snap| {
+                                snap.push_output(
+                                    OutputKind::Error,
+                                    "Walk failed. Try ':walk from <start> to <end> as <type>' with raw addresses.".into(),
+                                );
+                                snap.status_message = None;
+                            });
+                            self.walk_state = None;
+                        }
+                    }
+                }
+                // If a walk-populate VarCreate failed, skip that element
+                // and continue with the next one.
+                if matches!(kind, Some(PendingKind::VarCreate { .. }))
+                    && self.walk_state.is_some()
+                {
+                    self.walk_populate_next().await;
+                }
+
+                // Python helper command failed.
+                match kind {
+                    Some(PendingKind::PyBacktrace)
+                    | Some(PendingKind::PyList)
+                    | Some(PendingKind::PyLocals) => {
+                        // Most likely python-gdb.py isn't loaded (undefined
+                        // command).  Give up on the Python view and fall back to
+                        // the native panels / hint text.
+                        self.console_capture = None;
+                        let first_failure = !self.python_probe_failed;
+                        self.python_probe_failed = true;
+                        self.update_snapshot(|snap| {
+                            snap.python_helpers_ok = false;
+                            snap.source_loading = false;
+                            if first_failure && msg.contains("Undefined command") {
+                                snap.push_output(
+                                    OutputKind::Error,
+                                    "CPython helpers not loaded (py-bt undefined). The Python \
+                                     view needs python-gdb.py. Install python debuginfo, or point \
+                                     gdbscope at the helper: --python-gdb <libpython.py>. You can \
+                                     also load it now with ':source <path>'."
+                                        .into(),
+                                );
+                            }
+                        });
+                    }
+                    Some(PendingKind::PyNavigate) => {
+                        // Stepped past the ends of the Python stack; clamp and
+                        // resync source/locals to wherever CPython landed.
+                        self.py_nav = None;
+                        self.update_snapshot(|snap| {
+                            snap.source_loading = false;
+                        });
+                    }
+                    _ => {}
                 }
             }
             "exit" => {
@@ -753,7 +952,7 @@ impl GdbController {
             PendingKind::Ptype => {
                 debug!("ptype complete (results in console output)");
             }
-            PendingKind::VarCreate { expr } => {
+            PendingKind::VarCreate { expr, display_name } => {
                 let name = MiBody::get_str(body, "name").unwrap_or("").to_string();
                 let numchild: u32 = MiBody::get_str(body, "numchild")
                     .and_then(|s| s.parse().ok())
@@ -768,9 +967,10 @@ impl GdbController {
                 } else {
                     let has_children = numchild > 0;
                     let var_name = name.clone();
+                    let label = display_name.unwrap_or_else(|| expr.clone());
                     let node = crate::state::ExplorerNode {
                         var_name: name,
-                        display_name: expr.clone(),
+                        display_name: label,
                         type_name,
                         value,
                         has_children,
@@ -782,7 +982,6 @@ impl GdbController {
                     };
                     self.update_snapshot(|snap| {
                         snap.explorer_nodes.push(node);
-                        snap.push_output(OutputKind::Info, format!("Explorer: added '{expr}'"));
                     });
                     if has_children {
                         let (tok, mi) = self.commands.var_list_children(&var_name);
@@ -791,6 +990,10 @@ impl GdbController {
                             insert_under: var_name,
                         });
                         let _ = self.send_raw(&mi).await;
+                    }
+                    // If a walk is in progress, chain the next element.
+                    if self.walk_state.is_some() {
+                        self.walk_populate_next().await;
                     }
                 }
             }
@@ -810,6 +1013,154 @@ impl GdbController {
             }
             PendingKind::VarUpdate => {
                 self.process_var_update(body);
+            }
+            PendingKind::WalkDetectType { expr } => {
+                let type_name = MiBody::get_str(body, "type").unwrap_or("").to_string();
+                let var_name = MiBody::get_str(body, "name").unwrap_or("").to_string();
+                if !var_name.is_empty() {
+                    let (tok, mi) = self.commands.var_delete(&var_name);
+                    self.pending.insert(tok, PendingKind::VarDelete);
+                    let _ = self.send_raw(&mi).await;
+                }
+                if let Some(elem_type) = parse_list_element_type(&type_name) {
+                    self.update_snapshot(|snap| {
+                        snap.push_output(
+                            OutputKind::Info,
+                            format!("Walk: detected element type '{elem_type}'"),
+                        );
+                    });
+                    let eval_expr = format!(
+                        "(unsigned long)&(({expr})._M_impl._M_node)"
+                    );
+                    self.walk_state = Some(WalkState {
+                        sentinel_addr: 0,
+                        element_type: elem_type,
+                        node_addrs: Vec::new(),
+                        populate_index: 0,
+                    });
+                    let (tok, mi) = self.commands.data_evaluate_expression(&eval_expr);
+                    self.pending.insert(tok, PendingKind::WalkSentinel { expr });
+                    let _ = self.send_raw(&mi).await;
+                } else {
+                    self.update_snapshot(|snap| {
+                        snap.push_output(
+                            OutputKind::Error,
+                            format!(
+                                "Walk: could not detect list element type from '{type_name}'. \
+                                 Use ':walk {expr} as <type>' to specify it."
+                            ),
+                        );
+                        snap.status_message = None;
+                    });
+                }
+            }
+            PendingKind::WalkSentinel { expr } => {
+                let addr = parse_walk_addr(body);
+                if let Some(sentinel) = addr {
+                    if let Some(ref mut ws) = self.walk_state {
+                        ws.sentinel_addr = sentinel;
+                    }
+                    let eval_expr = format!(
+                        "(unsigned long)(({expr})._M_impl._M_node._M_next)"
+                    );
+                    let (tok, mi) = self.commands.data_evaluate_expression(&eval_expr);
+                    self.pending.insert(tok, PendingKind::WalkFirst);
+                    let _ = self.send_raw(&mi).await;
+                } else {
+                    self.update_snapshot(|snap| {
+                        snap.push_output(
+                            OutputKind::Error,
+                            "Walk: failed to read sentinel address".into(),
+                        );
+                        snap.status_message = None;
+                    });
+                    self.walk_state = None;
+                }
+            }
+            PendingKind::WalkFirst => {
+                let addr = parse_walk_addr(body);
+                let sentinel = self.walk_state.as_ref().map(|ws| ws.sentinel_addr).unwrap_or(0);
+                if let Some(first) = addr {
+                    if first == sentinel || first == 0 {
+                        self.update_snapshot(|snap| {
+                            snap.push_output(OutputKind::Info, "Walk complete: list is empty".into());
+                            snap.status_message = None;
+                        });
+                        self.walk_state = None;
+                    } else {
+                        if let Some(ref mut ws) = self.walk_state {
+                            ws.node_addrs.push(first);
+                        }
+                        self.update_snapshot(|snap| {
+                            snap.status_message = Some("Walking: found 1 element...".into());
+                        });
+                        let eval_expr = format!("*(unsigned long*){first:#x}");
+                        let (tok, mi) = self.commands.data_evaluate_expression(&eval_expr);
+                        self.pending.insert(tok, PendingKind::WalkNext);
+                        let _ = self.send_raw(&mi).await;
+                    }
+                } else {
+                    self.update_snapshot(|snap| {
+                        snap.push_output(
+                            OutputKind::Error,
+                            "Walk: failed to read first node address".into(),
+                        );
+                        snap.status_message = None;
+                    });
+                    self.walk_state = None;
+                }
+            }
+            PendingKind::WalkNext => {
+                let addr = parse_walk_addr(body);
+                let (sentinel, count) = self.walk_state.as_ref()
+                    .map(|ws| (ws.sentinel_addr, ws.node_addrs.len()))
+                    .unwrap_or((0, 0));
+                if let Some(next) = addr {
+                    if next == sentinel || next == 0 || count >= WALK_MAX_ELEMENTS {
+                        if count >= WALK_MAX_ELEMENTS {
+                            self.update_snapshot(|snap| {
+                                snap.push_output(
+                                    OutputKind::Info,
+                                    format!("Walk: hit cap of {WALK_MAX_ELEMENTS} elements"),
+                                );
+                            });
+                        }
+                        self.walk_start_populate().await;
+                    } else {
+                        if let Some(ref mut ws) = self.walk_state {
+                            ws.node_addrs.push(next);
+                            let n = ws.node_addrs.len();
+                            self.update_snapshot(|snap| {
+                                snap.status_message =
+                                    Some(format!("Walking: found {n} elements..."));
+                            });
+                        }
+                        let eval_expr = format!("*(unsigned long*){next:#x}");
+                        let (tok, mi) = self.commands.data_evaluate_expression(&eval_expr);
+                        self.pending.insert(tok, PendingKind::WalkNext);
+                        let _ = self.send_raw(&mi).await;
+                    }
+                } else {
+                    self.update_snapshot(|snap| {
+                        snap.push_output(
+                            OutputKind::Error,
+                            format!("Walk: failed to read next pointer after {count} elements, populating with what we have"),
+                        );
+                    });
+                    self.walk_start_populate().await;
+                }
+            }
+            PendingKind::PyBacktrace => {
+                self.process_py_backtrace().await;
+            }
+            PendingKind::PyList => {
+                self.process_py_list().await;
+            }
+            PendingKind::PyLocals => {
+                self.process_py_locals();
+            }
+            PendingKind::PyNavigate => {
+                self.process_py_navigate().await;
             }
             PendingKind::PatchBytes { addr, byte_count } => {
                 debug!("patch bytes complete at {addr:#x}");
@@ -1456,7 +1807,7 @@ impl GdbController {
                 self.next_explorer_id += 1;
                 let name = format!("exp_{id}");
                 let (tok, mi) = self.commands.var_create(&name, &expr);
-                self.pending.insert(tok, PendingKind::VarCreate { expr });
+                self.pending.insert(tok, PendingKind::VarCreate { expr, display_name: None });
                 self.send_raw(&mi).await?;
             }
             GdbCommand::ExplorerExpand(var_name) => {
@@ -1499,10 +1850,127 @@ impl GdbController {
                 self.pending.insert(tok, PendingKind::CliCommand);
                 self.send_raw(&mi).await?;
             }
+            GdbCommand::Walk { expr, cast_type } => {
+                self.update_snapshot(|snap| {
+                    snap.push_output(OutputKind::Info, format!("Walking list: {expr}..."));
+                    snap.status_message = Some("Walking list...".into());
+                });
+                if let Some(ct) = cast_type {
+                    self.walk_state = Some(WalkState {
+                        sentinel_addr: 0,
+                        element_type: ct,
+                        node_addrs: Vec::new(),
+                        populate_index: 0,
+                    });
+                    let eval_expr = format!(
+                        "(unsigned long)&(({expr})._M_impl._M_node)"
+                    );
+                    let (tok, mi) = self.commands.data_evaluate_expression(&eval_expr);
+                    self.pending.insert(tok, PendingKind::WalkSentinel { expr });
+                    self.send_raw(&mi).await?;
+                } else {
+                    let id = self.next_explorer_id;
+                    self.next_explorer_id += 1;
+                    let tmp_name = format!("walk_tmp_{id}");
+                    let (tok, mi) = self.commands.var_create(&tmp_name, &expr);
+                    self.pending.insert(tok, PendingKind::WalkDetectType { expr });
+                    self.send_raw(&mi).await?;
+                }
+            }
+            GdbCommand::WalkRaw { start_addr, end_addr, cast_type } => {
+                let start = parse_addr_string(&start_addr);
+                let end = parse_addr_string(&end_addr);
+                match (start, end) {
+                    (Some(s), Some(e)) => {
+                        self.update_snapshot(|snap| {
+                            snap.push_output(
+                                OutputKind::Info,
+                                format!("Walking from {s:#x} to {e:#x} as {cast_type}..."),
+                            );
+                            snap.status_message = Some("Walking list...".into());
+                        });
+                        self.walk_state = Some(WalkState {
+                            sentinel_addr: e,
+                            element_type: cast_type,
+                            node_addrs: vec![s],
+                            populate_index: 0,
+                        });
+                        let eval_expr = format!("*(unsigned long*){s:#x}");
+                        let (tok, mi) = self.commands.data_evaluate_expression(&eval_expr);
+                        self.pending.insert(tok, PendingKind::WalkNext);
+                        self.send_raw(&mi).await?;
+                    }
+                    _ => {
+                        self.update_snapshot(|snap| {
+                            snap.push_output(
+                                OutputKind::Error,
+                                format!("Walk: invalid address(es): start={start_addr}, end={end_addr}"),
+                            );
+                        });
+                    }
+                }
+            }
             GdbCommand::RawCommand(raw) => {
                 let (tok, mi) = self.commands.cli_command(&raw);
                 self.pending.insert(tok, PendingKind::CliCommand);
                 self.send_raw(&mi).await?;
+            }
+            GdbCommand::TogglePythonMode => {
+                let (available, in_python) = {
+                    let s = self.state.load();
+                    (s.python_available, s.python_mode)
+                };
+                if in_python {
+                    // Switch back to the native (C) view.
+                    self.python_forced_native = true;
+                    self.update_snapshot(|s| {
+                        s.python_mode = false;
+                        if !s.native_stack.is_empty() {
+                            s.stack = std::mem::take(&mut s.native_stack);
+                        }
+                        s.locals = std::mem::take(&mut s.native_locals);
+                        s.current_frame_level = 0;
+                        s.python_frame_level = 0;
+                    });
+                    self.load_source_for_frame(0).await;
+                    self.load_disasm_for_frame(0).await;
+                } else if available {
+                    // Enter the Python view.
+                    self.python_forced_native = false;
+                    self.python_probe_failed = false;
+                    self.update_snapshot(|s| {
+                        s.python_mode = true;
+                        s.current_frame_level = 0;
+                    });
+                    self.refresh_python().await;
+                } else {
+                    self.update_snapshot(|s| {
+                        s.push_output(
+                            OutputKind::Info,
+                            "No CPython frames detected in the current stack.".into(),
+                        );
+                    });
+                }
+            }
+            GdbCommand::SelectPythonFrame { level } => {
+                let cur = self.state.load().python_frame_level;
+                if level != cur {
+                    let going_up = level > cur;
+                    let remaining = if going_up { level - cur } else { cur - level };
+                    self.py_nav = Some(PyNavState {
+                        remaining,
+                        going_up,
+                        target_level: level,
+                    });
+                    self.update_snapshot(|s| {
+                        s.current_frame_level = level;
+                        s.source_loading = true;
+                    });
+                    self.send_py_nav_step().await?;
+                }
+            }
+            GdbCommand::RefreshPython => {
+                self.refresh_python().await;
             }
             GdbCommand::Quit => {
                 self.shutdown().await;
@@ -1741,6 +2209,260 @@ impl GdbController {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Python (CPython) integration — drive python-gdb.py helper commands and
+    // feed the Python-level view into the shared stack/locals/source state.
+    // -----------------------------------------------------------------------
+
+    /// Start (or restart) the full Python refresh cascade: py-bt, then py-list,
+    /// then py-locals, each issued from the previous command's `^done` so their
+    /// console output never interleaves.
+    async fn refresh_python(&mut self) {
+        if self.console_capture.is_some() {
+            return; // a cascade is already running
+        }
+        self.update_snapshot(|s| {
+            s.source_loading = true;
+        });
+        if let Err(e) = self.send_py_capture(PyCaptureKind::Backtrace).await {
+            warn!("failed to send py-bt: {e:#}");
+        }
+    }
+
+    /// Take the accumulated console-capture lines, warning if the finishing
+    /// command doesn't match the armed capture (should not happen given the
+    /// cascade is strictly serialized).
+    fn take_console_capture(&mut self, expected: PyCaptureKind) -> Vec<String> {
+        match self.console_capture.take() {
+            Some(cap) => {
+                if cap.kind != expected {
+                    warn!(
+                        "console capture kind mismatch (token {}): expected {:?}, got {:?}",
+                        cap.token, expected, cap.kind
+                    );
+                }
+                cap.lines
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Issue a py-* command and arm the console capture buffer for it.
+    async fn send_py_capture(&mut self, kind: PyCaptureKind) -> Result<()> {
+        let (tok, mi) = match kind {
+            PyCaptureKind::Backtrace => self.commands.py_bt(),
+            PyCaptureKind::List => self.commands.py_list(),
+            PyCaptureKind::Locals => self.commands.py_locals(),
+        };
+        let pending = match kind {
+            PyCaptureKind::Backtrace => PendingKind::PyBacktrace,
+            PyCaptureKind::List => PendingKind::PyList,
+            PyCaptureKind::Locals => PendingKind::PyLocals,
+        };
+        self.console_capture = Some(ConsoleCapture {
+            token: tok,
+            kind,
+            lines: Vec::new(),
+        });
+        self.pending.insert(tok, pending);
+        self.send_raw(&mi).await
+    }
+
+    /// Issue a single py-up or py-down step for the in-progress navigation.
+    async fn send_py_nav_step(&mut self) -> Result<()> {
+        let going_up = self.py_nav.as_ref().map_or(true, |n| n.going_up);
+        let (tok, mi) = if going_up {
+            self.commands.py_up()
+        } else {
+            self.commands.py_down()
+        };
+        self.pending.insert(tok, PendingKind::PyNavigate);
+        self.send_raw(&mi).await
+    }
+
+    /// Handle py-bt `^done`: parse the Python backtrace and, if we should show
+    /// the Python view, populate the stack and continue the cascade.
+    async fn process_py_backtrace(&mut self) {
+        let lines = self.take_console_capture(PyCaptureKind::Backtrace);
+        let (frames, src_map) = parse_py_bt(&lines);
+
+        // The command succeeded, so the helpers are loaded.
+        self.python_probe_failed = false;
+
+        if frames.is_empty() {
+            // Helpers present but no Python frame at this stop (e.g. stopped in
+            // a pure-C thread).  Stay native.
+            self.update_snapshot(|s| {
+                s.python_helpers_ok = true;
+                s.source_loading = false;
+            });
+            return;
+        }
+
+        self.py_bt_src = src_map;
+
+        // Auto-enter Python view the first time helpers resolve, unless the user
+        // has explicitly forced the native view.
+        let enter = {
+            let s = self.state.load();
+            s.python_mode || !self.python_forced_native
+        };
+
+        self.update_snapshot(|s| {
+            s.python_helpers_ok = true;
+            if enter {
+                s.python_mode = true;
+                // Preserve the native C stack so the `Y` toggle can restore it.
+                s.native_stack = s.stack.clone();
+                s.stack = frames;
+                s.python_frame_level = 0;
+                if s.current_frame_level as usize >= s.stack.len() {
+                    s.current_frame_level = 0;
+                }
+            }
+        });
+
+        if self.state.load().python_mode {
+            if let Err(e) = self.send_py_capture(PyCaptureKind::List).await {
+                warn!("failed to send py-list: {e:#}");
+            }
+        } else {
+            self.update_snapshot(|s| s.source_loading = false);
+        }
+    }
+
+    /// Handle py-list `^done`: resolve source for the current Python frame and
+    /// continue the cascade with py-locals.
+    async fn process_py_list(&mut self) {
+        let lines = self.take_console_capture(PyCaptureKind::List);
+        let (cur_line, rows) = parse_py_list(&lines);
+        self.load_python_source(cur_line, &rows).await;
+
+        if let Err(e) = self.send_py_capture(PyCaptureKind::Locals).await {
+            warn!("failed to send py-locals: {e:#}");
+        }
+    }
+
+    /// Handle py-locals `^done`: parse Python locals into the locals panel.
+    fn process_py_locals(&mut self) {
+        let lines = self.take_console_capture(PyCaptureKind::Locals);
+        let locals = parse_py_locals(&lines);
+        self.update_snapshot(|s| {
+            if s.python_mode {
+                s.native_locals = s.locals.clone();
+                s.locals = locals;
+            }
+            s.source_loading = false;
+        });
+    }
+
+    /// Handle py-up / py-down `^done`: step to the target frame, then re-run the
+    /// py-list + py-locals partial cascade for the newly selected frame.
+    async fn process_py_navigate(&mut self) {
+        if let Some(nav) = self.py_nav.as_mut() {
+            nav.remaining = nav.remaining.saturating_sub(1);
+            if nav.remaining > 0 {
+                if let Err(e) = self.send_py_nav_step().await {
+                    warn!("failed to send py-up/py-down: {e:#}");
+                }
+                return;
+            }
+        }
+        let target = self.py_nav.take().map_or(0, |n| n.target_level);
+        self.update_snapshot(|s| {
+            s.python_frame_level = target;
+            s.source_loading = true;
+        });
+        if self.console_capture.is_none() {
+            if let Err(e) = self.send_py_capture(PyCaptureKind::List).await {
+                warn!("failed to send py-list after navigation: {e:#}");
+            }
+        }
+    }
+
+    /// Find a Python source file on disk: the recorded path if it exists, else
+    /// the same path joined under the configured sysroot (for cross-system
+    /// cores whose `.py` lives inside the collected bundle).
+    fn resolve_python_source_path(&self, path: &str) -> Option<String> {
+        if std::path::Path::new(path).exists() {
+            return Some(path.to_string());
+        }
+        if let Some(root) = &self.sysroot {
+            let joined = format!(
+                "{}/{}",
+                root.trim_end_matches('/'),
+                path.trim_start_matches('/')
+            );
+            if std::path::Path::new(&joined).exists() {
+                return Some(joined);
+            }
+        }
+        None
+    }
+
+    /// Resolve and load source for the currently selected Python frame.  Prefer
+    /// the real `.py` file on disk (full syntect highlighting); fall back to the
+    /// py-list text when the file isn't present locally (remote / core dumps).
+    async fn load_python_source(&mut self, pylist_line: Option<u32>, rows: &[(u32, String)]) {
+        let (fullname, line) = {
+            let s = self.state.load();
+            let lvl = s.python_frame_level;
+            match s.stack.iter().find(|f| f.level == lvl) {
+                Some(f) => (f.fullname.clone(), f.line.or(pylist_line)),
+                None => (None, pylist_line),
+            }
+        };
+
+        let Some(path) = fullname else {
+            self.update_snapshot(|s| s.source_loading = false);
+            return;
+        };
+
+        // Prefer the real file on disk. Python records the script's original
+        // absolute path (e.g. from the machine that produced a core), so when
+        // that path is absent, also try it under the configured sysroot — this
+        // lets a `gdbscope-collect` bundle serve the source directly.
+        if let Some(disk_path) = self.resolve_python_source_path(&path) {
+            self.maybe_load_source(&disk_path).await;
+            let cached = self.source_cache.get(&disk_path).cloned();
+            self.update_snapshot(|s| {
+                s.source = cached;
+                s.source_line = line;
+                s.source_loading = false;
+            });
+            return;
+        }
+
+        // File not on disk: synthesize a SourceFile from the py-list output, or
+        // from the single source line py-bt captured for this frame.
+        let synthetic = if !rows.is_empty() {
+            Some(build_synthetic_source(&path, rows))
+        } else {
+            let lvl = self.state.load().python_frame_level;
+            self.py_bt_src.get(&lvl).and_then(|text| {
+                line.map(|n| build_synthetic_source(&path, &[(n, text.clone())]))
+            })
+        };
+
+        match synthetic {
+            Some(src) => {
+                self.source_cache.insert(path.clone(), src.clone());
+                self.update_snapshot(|s| {
+                    s.source = Some(src);
+                    s.source_line = line.or(pylist_line);
+                    s.source_loading = false;
+                });
+            }
+            None => {
+                self.update_snapshot(|s| {
+                    s.source = None;
+                    s.source_line = line;
+                    s.source_loading = false;
+                });
+            }
+        }
+    }
+
     /// Load disassembly around the address of the frame at `level`.
     /// Pick the right step command for tracing: source-level if we have
     /// line info, instruction-level otherwise.
@@ -1896,9 +2618,11 @@ impl GdbController {
         }
 
         let has_debug = frames.first().map_or(false, |f| f.fullname.is_some());
+        let has_python = stack_looks_like_cpython(&frames);
         self.update_snapshot(|snap| {
             snap.has_debug_info = has_debug;
             snap.stack = frames;
+            snap.python_available = has_python;
         });
 
         if self.tracing {
@@ -1913,6 +2637,21 @@ impl GdbController {
             let level = self.state.load().current_frame_level;
             self.load_source_for_frame(level).await;
             self.load_disasm_for_frame(level).await;
+
+            // CPython detection: probe / refresh the Python-level view.  We run
+            // the py-* cascade when already in Python mode, or once to probe
+            // whether the python-gdb.py helpers are available (auto-enter on
+            // success).  Skip if the user has forced the native view, a probe
+            // already failed, or a capture is already in flight.
+            if has_python
+                && !self.python_forced_native
+                && self.console_capture.is_none()
+            {
+                let in_python = self.state.load().python_mode;
+                if in_python || !self.python_probe_failed {
+                    self.refresh_python().await;
+                }
+            }
         }
     }
 
@@ -2487,6 +3226,73 @@ impl GdbController {
             });
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Walk helpers — populate Explorer from collected node addresses
+    // -----------------------------------------------------------------------
+
+    async fn walk_start_populate(&mut self) {
+        if let Some(ref mut ws) = self.walk_state {
+            let count = ws.node_addrs.len();
+            ws.populate_index = 0;
+            self.update_snapshot(|snap| {
+                snap.push_output(
+                    OutputKind::Info,
+                    format!("Walk: found {count} elements, adding to Explorer..."),
+                );
+                snap.status_message = Some(format!("Populating Explorer: 0/{count}..."));
+            });
+        }
+        self.walk_populate_next().await;
+    }
+
+    async fn walk_populate_next(&mut self) {
+        let info = self.walk_state.as_ref().map(|ws| {
+            (ws.populate_index, ws.node_addrs.len(), ws.element_type.clone())
+        });
+        let Some((idx, total, elem_type)) = info else {
+            return;
+        };
+
+        if idx >= total {
+            self.update_snapshot(|snap| {
+                snap.push_output(
+                    OutputKind::Info,
+                    format!("Walk complete: {total} elements added to Explorer"),
+                );
+                snap.status_message = None;
+            });
+            self.walk_state = None;
+            return;
+        }
+
+        let node_addr = self.walk_state.as_ref().unwrap().node_addrs[idx];
+        let expr = format!(
+            "*({elem_type}*)((char*){node_addr:#x} + 2*sizeof(void*))"
+        );
+        let label = format!("[{idx}] {elem_type} @ {node_addr:#x}");
+
+        let id = self.next_explorer_id;
+        self.next_explorer_id += 1;
+        let var_name = format!("exp_{id}");
+        let (tok, mi) = self.commands.var_create(&var_name, &expr);
+        self.pending.insert(tok, PendingKind::VarCreate {
+            expr,
+            display_name: Some(label),
+        });
+        let _ = self.send_raw(&mi).await;
+
+        if let Some(ref mut ws) = self.walk_state {
+            ws.populate_index += 1;
+            let next_idx = ws.populate_index;
+            self.update_snapshot(|snap| {
+                snap.status_message =
+                    Some(format!("Populating Explorer: {next_idx}/{total}..."));
+            });
+        }
+        // The VarCreate response handler chains the next call via
+        // walk_populate_next when walk_state is active.
+    }
 }
 
 // ===========================================================================
@@ -2530,6 +3336,205 @@ fn parse_frame(val: &MiValue) -> Option<Frame> {
         line,
         args,
     })
+}
+
+// ---------------------------------------------------------------------------
+// CPython python-gdb.py output parsers
+// ---------------------------------------------------------------------------
+
+/// Return true if the native stack looks like a CPython interpreter (contains
+/// `PyEval`/`_Py` C frames).
+fn stack_looks_like_cpython(frames: &[Frame]) -> bool {
+    frames.iter().any(|f| {
+        f.func
+            .as_deref()
+            .map_or(false, |n| n.contains("PyEval") || n.contains("_Py"))
+    })
+}
+
+/// Parse a single `py-bt` frame line into (path, line, func).
+///
+/// Handles both the `File "<path>", line <n>, in <func>` form and the
+/// `#N Frame 0x..., for file <path>, line <n>, in <func> (args)` form.
+fn parse_py_frame_line(s: &str) -> Option<(String, u32, String)> {
+    let (path, rest) = if let Some(idx) = s.find("File \"") {
+        let after = &s[idx + 6..];
+        let end = after.find('"')?;
+        (after[..end].to_string(), &after[end + 1..])
+    } else if let Some(idx) = s.find("for file ") {
+        let after = &s[idx + 9..];
+        let end = after.find(", line")?;
+        (after[..end].trim().to_string(), &after[end..])
+    } else {
+        return None;
+    };
+
+    let line_idx = rest.find("line ")?;
+    let after_line = &rest[line_idx + 5..];
+    let num_end = after_line
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after_line.len());
+    if num_end == 0 {
+        return None;
+    }
+    let lineno: u32 = after_line[..num_end].parse().ok()?;
+
+    let func = rest
+        .find(", in ")
+        .map(|i| {
+            rest[i + 5..]
+                .trim()
+                .split_ascii_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .unwrap_or_default();
+
+    Some((path, lineno, func))
+}
+
+/// Parse `py-bt` output into Python frames (0 = innermost) plus a map of
+/// frame level -> source-line text (used as a source fallback for cores).
+fn parse_py_bt(lines: &[String]) -> (Vec<Frame>, HashMap<u32, String>) {
+    let mut frames = Vec::new();
+    let mut src_map = HashMap::new();
+    let mut pending_src_level: Option<u32> = None;
+
+    for raw in lines {
+        let line = raw.trim_end_matches(['\n', '\r']);
+        let trimmed = line.trim_start();
+
+        if let Some((path, lineno, func)) = parse_py_frame_line(trimmed) {
+            let level = frames.len() as u32;
+            let file = std::path::Path::new(&path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned());
+            frames.push(Frame {
+                level,
+                addr: 0,
+                func: Some(func),
+                file,
+                fullname: Some(path),
+                line: Some(lineno),
+                args: Vec::new(),
+            });
+            pending_src_level = Some(level);
+        } else if let Some(level) = pending_src_level.take() {
+            let src = trimmed.trim();
+            if !src.is_empty() && !src.starts_with("Traceback") {
+                src_map.insert(level, src.to_string());
+            }
+        }
+    }
+
+    (frames, src_map)
+}
+
+/// Parse `py-list` output into (current line, numbered source rows).
+fn parse_py_list(lines: &[String]) -> (Option<u32>, Vec<(u32, String)>) {
+    let mut cur = None;
+    let mut rows = Vec::new();
+
+    for raw in lines {
+        let line = raw.trim_end_matches(['\n', '\r']);
+        let body = line.trim_start();
+        let (is_cur, rest) = match body.strip_prefix('>') {
+            Some(r) => (true, r.trim_start()),
+            None => (false, body),
+        };
+
+        let num_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if num_end == 0 {
+            continue; // not a numbered source line
+        }
+        let Ok(n) = rest[..num_end].parse::<u32>() else {
+            continue;
+        };
+
+        // Drop the fixed separator (up to 4 spaces) after the line number,
+        // preserving the source line's own indentation.
+        let mut text = &rest[num_end..];
+        let mut stripped = 0;
+        while stripped < 4 && text.starts_with(' ') {
+            text = &text[1..];
+            stripped += 1;
+        }
+
+        if is_cur {
+            cur = Some(n);
+        }
+        rows.push((n, text.to_string()));
+    }
+
+    (cur, rows)
+}
+
+/// Best-effort Python type inference from a repr like `<Foo object at ...>`.
+fn infer_py_type(value: &str) -> String {
+    let v = value.trim();
+    if let Some(rest) = v.strip_prefix('<') {
+        if let Some(word) = rest.split_ascii_whitespace().next() {
+            let word = word.trim_end_matches('>');
+            return word.rsplit('.').next().unwrap_or(word).to_string();
+        }
+    }
+    String::new()
+}
+
+/// Parse `py-locals` output (`name = repr`) into variables.  Continuation lines
+/// (multi-line reprs) are appended to the previous variable's value.
+fn parse_py_locals(lines: &[String]) -> Vec<Variable> {
+    let mut vars: Vec<Variable> = Vec::new();
+
+    for raw in lines {
+        let line = raw.trim_end_matches(['\n', '\r']);
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        if let Some(idx) = line.find(" = ") {
+            let name = line[..idx].trim().to_string();
+            if !name.is_empty() && !name.contains(char::is_whitespace) {
+                let value = line[idx + 3..].trim().to_string();
+                let type_name = infer_py_type(&value);
+                vars.push(Variable {
+                    name,
+                    value,
+                    type_name,
+                });
+                continue;
+            }
+        }
+
+        if let Some(last) = vars.last_mut() {
+            last.value.push('\n');
+            last.value.push_str(line.trim());
+        }
+    }
+
+    vars
+}
+
+/// Build a synthetic [`SourceFile`] from numbered source rows, padding leading
+/// lines so gutter line numbers line up with the file's real line numbers.
+fn build_synthetic_source(path: &str, rows: &[(u32, String)]) -> SourceFile {
+    let max_line = rows.iter().map(|(n, _)| *n).max().unwrap_or(0) as usize;
+    let mut lines = vec![String::new(); max_line];
+    for (n, text) in rows {
+        let idx = *n as usize;
+        if idx >= 1 && idx <= lines.len() {
+            lines[idx - 1] = text.clone();
+        }
+    }
+    let highlighted = crate::highlight::highlight_lines(path, &lines);
+    SourceFile {
+        path: path.to_string(),
+        lines,
+        highlighted,
+    }
 }
 
 /// Extract a [`Thread`] from an MI tuple value.
@@ -2827,6 +3832,73 @@ fn collect_subdirs(root: &std::path::Path) -> std::io::Result<Vec<String>> {
 }
 
 // ===========================================================================
+// Walk helpers
+// ===========================================================================
+
+/// Parse an unsigned integer from a `-data-evaluate-expression` result body.
+/// GDB returns the value as a string that may be decimal or hex.
+fn parse_walk_addr(body: &[(String, MiValue)]) -> Option<u64> {
+    let raw = MiBody::get_str(body, "value")?;
+    parse_addr_string(raw)
+}
+
+fn parse_addr_string(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u64>().ok()
+    }
+}
+
+/// Extract the element type from a std::list type string.
+///
+/// Examples:
+///   "std::list<DsEventQueue *, std::allocator<...>>" → Some("DsEventQueue")
+///   "std::__cxx11::list<Foo, ...>" → Some("Foo")
+///   "int" → None
+fn parse_list_element_type(type_str: &str) -> Option<String> {
+    let start = type_str.find("list<")?;
+    let after_list = start + "list<".len();
+    let rest = &type_str[after_list..];
+
+    // Walk characters, tracking angle bracket depth, to find the first ','
+    // at depth 0 or the closing '>'.
+    let mut depth = 0u32;
+    let mut end = rest.len();
+    for (i, ch) in rest.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+                depth -= 1;
+            }
+            ',' if depth == 0 => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let raw_elem = rest[..end].trim().to_string();
+    if raw_elem.is_empty() {
+        return None;
+    }
+
+    // If element type is a pointer (e.g. "DsEventQueue *"), strip the pointer
+    // so we dereference through to the actual struct.
+    let elem = raw_elem.trim_end_matches(|c: char| c == '*' || c.is_whitespace());
+    if elem.is_empty() {
+        return None;
+    }
+    Some(elem.to_string())
+}
+
+// ===========================================================================
 // Tests for analysis helpers
 // ===========================================================================
 
@@ -2882,5 +3954,166 @@ mod analysis_tests {
     #[test]
     fn parse_struct_fields_empty() {
         assert!(parse_struct_fields("{}").is_empty());
+    }
+
+    #[test]
+    fn parse_list_element_type_pointer() {
+        let t = "std::__cxx11::list<DsEventQueue *, std::allocator<DsEventQueue *>>";
+        assert_eq!(parse_list_element_type(t), Some("DsEventQueue".into()));
+    }
+
+    #[test]
+    fn parse_list_element_type_value() {
+        let t = "std::list<MyStruct, std::allocator<MyStruct>>";
+        assert_eq!(parse_list_element_type(t), Some("MyStruct".into()));
+    }
+
+    #[test]
+    fn parse_list_element_type_nested() {
+        let t = "std::list<std::shared_ptr<Foo>, std::allocator<std::shared_ptr<Foo>>>";
+        assert_eq!(parse_list_element_type(t), Some("std::shared_ptr<Foo>".into()));
+    }
+
+    #[test]
+    fn parse_list_element_type_not_list() {
+        assert_eq!(parse_list_element_type("int"), None);
+        assert_eq!(parse_list_element_type("std::vector<int>"), None);
+    }
+
+    #[test]
+    fn parse_addr_string_hex() {
+        assert_eq!(parse_addr_string("0x44b8370"), Some(0x44b8370));
+        assert_eq!(parse_addr_string("0X1A2B"), Some(0x1a2b));
+    }
+
+    #[test]
+    fn parse_addr_string_decimal() {
+        assert_eq!(parse_addr_string("12345"), Some(12345));
+    }
+
+    // --- CPython python-gdb.py output parsers -------------------------------
+
+    fn to_lines(s: &str) -> Vec<String> {
+        s.lines().map(String::from).collect()
+    }
+
+    #[test]
+    fn parse_py_bt_traceback_form() {
+        // CPython 3.8+ `py-bt` (most recent call first).
+        let out = to_lines(
+            "Traceback (most recent call first):\n  \
+             File \"/home/u/app.py\", line 42, in do_work\n    \
+             result = compute(x)\n  \
+             File \"/home/u/app.py\", line 90, in main\n    \
+             do_work(3)\n  \
+             File \"/home/u/app.py\", line 100, in <module>\n    \
+             main()",
+        );
+        let (frames, src) = parse_py_bt(&out);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].level, 0);
+        assert_eq!(frames[0].func.as_deref(), Some("do_work"));
+        assert_eq!(frames[0].line, Some(42));
+        assert_eq!(frames[0].fullname.as_deref(), Some("/home/u/app.py"));
+        assert_eq!(frames[0].file.as_deref(), Some("app.py"));
+        assert_eq!(frames[0].addr, 0);
+        assert_eq!(frames[2].func.as_deref(), Some("<module>"));
+        assert_eq!(src.get(&0).map(String::as_str), Some("result = compute(x)"));
+    }
+
+    #[test]
+    fn parse_py_bt_frame_form() {
+        // Alternate `#N Frame 0x... for file ..., line N, in func (args)` form.
+        let out = to_lines(
+            "#5 Frame 0x7f00, for file /srv/svc.py, line 12, in handler (req=<...>)\n\
+             #6 Frame 0x7f10, for file /srv/svc.py, line 55, in serve ()",
+        );
+        let (frames, _) = parse_py_bt(&out);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].fullname.as_deref(), Some("/srv/svc.py"));
+        assert_eq!(frames[0].line, Some(12));
+        assert_eq!(frames[0].func.as_deref(), Some("handler"));
+        assert_eq!(frames[1].func.as_deref(), Some("serve"));
+    }
+
+    #[test]
+    fn parse_py_bt_empty() {
+        assert!(parse_py_bt(&to_lines("Unable to locate python frame")).0.is_empty());
+        assert!(parse_py_bt(&[]).0.is_empty());
+    }
+
+    #[test]
+    fn parse_py_list_marks_current() {
+        let out = to_lines(
+            "  38    def do_work(x):\n  \
+             39        y = x + 1\n\
+             > 42        result = compute(x)\n  \
+             43        return result",
+        );
+        let (cur, rows) = parse_py_list(&out);
+        assert_eq!(cur, Some(42));
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0], (38, "def do_work(x):".to_string()));
+        // Deeper indentation beyond the 4-space separator is preserved.
+        assert_eq!(rows[1], (39, "    y = x + 1".to_string()));
+        assert_eq!(rows[2], (42, "    result = compute(x)".to_string()));
+    }
+
+    #[test]
+    fn parse_py_locals_basic() {
+        let out = to_lines(
+            "x = 3\n\
+             result = <Foo object at remote 0x7f00>\n\
+             self = <__main__.Bar object at remote 0x7f10>",
+        );
+        let vars = parse_py_locals(&out);
+        assert_eq!(vars.len(), 3);
+        assert_eq!(vars[0].name, "x");
+        assert_eq!(vars[0].value, "3");
+        assert_eq!(vars[1].name, "result");
+        assert_eq!(vars[1].type_name, "Foo");
+        assert_eq!(vars[2].type_name, "Bar");
+    }
+
+    #[test]
+    fn parse_py_locals_multiline_continuation() {
+        let out = to_lines("data = {'a': 1,\n 'b': 2}");
+        let vars = parse_py_locals(&out);
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].name, "data");
+        assert_eq!(vars[0].value, "{'a': 1,\n'b': 2}");
+    }
+
+    #[test]
+    fn build_synthetic_source_pads_leading_lines() {
+        let src = build_synthetic_source("/x/a.py", &[(3, "a = 1".into()), (4, "b = 2".into())]);
+        assert_eq!(src.lines.len(), 4);
+        assert_eq!(src.lines[0], "");
+        assert_eq!(src.lines[2], "a = 1");
+        assert_eq!(src.lines[3], "b = 2");
+    }
+
+    #[test]
+    fn stack_cpython_detection() {
+        let py_frame = Frame {
+            level: 0,
+            addr: 0x1000,
+            func: Some("_PyEval_EvalFrameDefault".into()),
+            file: None,
+            fullname: None,
+            line: None,
+            args: Vec::new(),
+        };
+        assert!(stack_looks_like_cpython(std::slice::from_ref(&py_frame)));
+        let c_frame = Frame {
+            level: 0,
+            addr: 0x1000,
+            func: Some("main".into()),
+            file: None,
+            fullname: None,
+            line: None,
+            args: Vec::new(),
+        };
+        assert!(!stack_looks_like_cpython(std::slice::from_ref(&c_frame)));
     }
 }

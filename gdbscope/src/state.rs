@@ -321,6 +321,14 @@ pub struct GdbSnapshot {
 
     // Debug info availability (false for stripped / no-symbols binaries)
     pub has_debug_info: bool,
+
+    // Python (CPython) integration
+    pub python_available: bool,   // CPython C-frames detected in the native stack
+    pub python_helpers_ok: bool,  // py-bt succeeded (python-gdb.py helpers loaded)
+    pub python_mode: bool,        // currently showing the Python-level view
+    pub python_frame_level: u32,  // selected Python frame (0 = innermost)
+    pub native_stack: Vec<Frame>, // C stack preserved while python_mode is on
+    pub native_locals: Vec<Variable>,
 }
 
 impl GdbSnapshot {
@@ -353,6 +361,12 @@ impl GdbSnapshot {
             target_executable: None,
             recording_count: 0,
             has_debug_info: false,
+            python_available: false,
+            python_helpers_ok: false,
+            python_mode: false,
+            python_frame_level: 0,
+            native_stack: Vec::new(),
+            native_locals: Vec::new(),
         }
     }
 

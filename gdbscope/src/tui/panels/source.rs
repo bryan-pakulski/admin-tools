@@ -69,9 +69,7 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
             ];
 
             // Detect runtime and show language-specific hints
-            let is_python = snap.stack.iter().any(|f| {
-                f.func.as_deref().map_or(false, |n| n.contains("PyEval") || n.contains("_Py"))
-            });
+            let is_python = snap.python_available;
             let is_ruby = snap.stack.iter().any(|f| {
                 f.func.as_deref().map_or(false, |n| n.contains("rb_") || n.contains("ruby"))
             });
@@ -82,10 +80,24 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
                 f.func.as_deref().map_or(false, |n| n.contains("v8::") || n.contains("node::"))
             });
 
-            if is_python {
+            if is_python && snap.python_helpers_ok && !snap.python_mode {
+                // Helpers are available but the user switched to the native view.
                 lines.extend_from_slice(&[
                     Line::from(Span::styled(
-                        "  Python runtime detected. Try these GDB commands (:):",
+                        "  CPython detected. Press Y to switch to the Python view",
+                        Style::default().fg(Color::Yellow),
+                    )),
+                    Line::from(Span::styled(
+                        "  (Python-level stack, source, and locals).",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ]);
+            } else if is_python {
+                // No python-gdb.py helpers (or not yet probed): fall back to the
+                // manual GDB command hints.
+                lines.extend_from_slice(&[
+                    Line::from(Span::styled(
+                        "  Python runtime detected. Press Y for the Python view, or use (:):",
                         Style::default().fg(Color::Yellow),
                     )),
                     Line::from(Span::styled("    py-bt          Python backtrace", Style::default().fg(Color::Cyan))),
@@ -94,7 +106,7 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot, view: &ViewState, foc
                     Line::from(Span::styled("    py-print EXPR  Evaluate Python expression", Style::default().fg(Color::Cyan))),
                     Line::from(""),
                     Line::from(Span::styled(
-                        "  Press : to enter a command, or navigate stack with [2].",
+                        "  If py-* are undefined, load helpers: set auto-load safe-path /",
                         Style::default().fg(Color::DarkGray),
                     )),
                 ]);

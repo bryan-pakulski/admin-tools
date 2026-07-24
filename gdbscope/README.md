@@ -26,7 +26,7 @@ gdbscope -r localhost:1234             # remote gdb server
 
 ### Off-site core dump analysis
 
-When analysing core dumps from a different OS (e.g. CentOS 7 core on an OL9 dev machine), shared libraries won't match. Use `gdbscope-collect` on the production machine to bundle the core with all its libraries:
+When analysing core dumps from a different OS (e.g. CentOS 7 core on an OL9 dev machine), shared libraries won't match. Use `gdbscope-collect` on the production machine to bundle the core with all its libraries, their **debuginfo**, and gdb auto-load scripts:
 
 ```bash
 # Production machine
@@ -37,6 +37,24 @@ scp coredump-server-*.tar.gz devbox:~/
 tar xf coredump-server-*.tar.gz
 gdbscope -e sysroot/opt/app/server -c sysroot/core.12345 --sysroot sysroot
 ```
+
+`gdbscope-collect` bundles each library's separate debuginfo (matched by build-id) and its gdb auto-load scripts, and gdbscope points `debug-file-directory` inside the bundle — so symbols and language helpers work off-site without installing matching debuginfo on the dev box. Install the relevant `*-debuginfo` packages on the **production** machine before collecting.
+
+#### Python (and other interpreted) core dumps
+
+A core belongs to the process — the **interpreter**, not the script. Pass the interpreter as `-e`; if you pass a `.py`, the collector detects the real interpreter from the core and keeps your script as an included source file. Use `-a` to bundle the application's source tree so Python frames resolve to real files.
+
+```bash
+# Production machine (needs python3-debuginfo installed)
+gdbscope-collect -e /usr/bin/python3 -c /var/cores/core.12345 \
+    -a /opt/OPENca/openCA-7.3.74.2/web/SonarSOAP
+
+# Dev machine
+tar xf coredump-python3-*.tar.gz
+gdbscope -e sysroot/usr/bin/python3 -c sysroot/core.12345 --sysroot sysroot
+```
+
+CPython's `py-bt`/`py-list`/`py-locals` need `libpython`'s debug symbols and its `pythonX.Y-gdb.py` helper — both come from `python3-debuginfo`. In gdbscope, press `Y` to toggle the Python-level view (stack, source, locals); it auto-enters when the helpers load. If the helper isn't auto-loaded, point at it with `--python-gdb <libpython.py>`.
 
 ## Layout
 

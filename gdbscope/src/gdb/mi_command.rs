@@ -448,6 +448,34 @@ impl MiCommandBuilder {
         )
     }
 
+    // -----------------------------------------------------------------
+    // CPython python-gdb.py helper commands
+    //
+    // These are thin wrappers over `cli_command`; their output arrives as
+    // console stream records (`~"..."`) which the controller captures and
+    // parses (see `refresh_python`).
+    // -----------------------------------------------------------------
+
+    pub fn py_bt(&self) -> (u64, String) {
+        self.cli_command("py-bt")
+    }
+
+    pub fn py_locals(&self) -> (u64, String) {
+        self.cli_command("py-locals")
+    }
+
+    pub fn py_list(&self) -> (u64, String) {
+        self.cli_command("py-list")
+    }
+
+    pub fn py_up(&self) -> (u64, String) {
+        self.cli_command("py-up")
+    }
+
+    pub fn py_down(&self) -> (u64, String) {
+        self.cli_command("py-down")
+    }
+
     pub fn gdb_exit(&self) -> (u64, String) {
         let tok = self.next();
         (tok, format!("{tok}-gdb-exit\n"))

@@ -117,8 +117,14 @@ pub enum Action {
     ToggleExplorer,       // I — toggle explorer panel / add from context
     PromptExplorerAdd,    // (internal) open prompt to add expression
 
+    // Inspector
+    InspectVariable,      // X — open variable inspector popup
+
     // Playback analysis
     ShowValueHistory,  // H — show value history for selected variable/register
+
+    // Python (CPython) view
+    TogglePythonMode,  // Y — toggle Python-level <-> native (C) view
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,11 +250,15 @@ pub fn map_normal(key: KeyEvent, quit_confirm: bool) -> Action {
         KeyCode::Char('f') => Action::PromptListFunctions,
         KeyCode::Char('s') => Action::ResolveSymbol,
 
-        // ---- Explorer ----
+        // ---- Explorer / Inspector ----
         KeyCode::Char('I') => Action::ToggleExplorer,
+        KeyCode::Char('X') => Action::InspectVariable,
 
         // ---- Playback analysis ----
         KeyCode::Char('H') => Action::ShowValueHistory,
+
+        // ---- Python view ----
+        KeyCode::Char('Y') => Action::TogglePythonMode,
 
         // ---- Timeline / playback ----
         KeyCode::Char('[') => Action::PlaybackPrev,

@@ -27,6 +27,7 @@ pub struct Config {
     pub trace_depth: usize,
     pub source_dirs: Vec<String>,
     pub sysroot: Option<String>,
+    pub python_gdb: Option<String>,
 }
 
 impl Config {
@@ -105,6 +106,7 @@ impl Config {
             trace_depth: args.trace_depth,
             source_dirs: args.source_dirs,
             sysroot: args.sysroot,
+            python_gdb: args.python_gdb,
         })
     }
 }

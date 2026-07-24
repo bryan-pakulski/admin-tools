@@ -30,6 +30,17 @@ impl GdbProcess {
         let mut cmd = Command::new(gdb_path);
         cmd.arg("--interpreter=mi3").arg("-q");
 
+        // Allow gdb to auto-load helper scripts shipped alongside object files —
+        // in particular CPython's `pythonX.Y-gdb.py`, which defines the
+        // `py-bt` / `py-list` / `py-locals` commands gdbscope drives for the
+        // Python view.  These `-iex` (initial eval) commands run *before* the
+        // inferior / core is loaded, which is required because gdb decides
+        // whether to auto-load a script at the moment the owning object file
+        // (libpython) is read — for attach and core targets that happens at
+        // launch, before any MI command could take effect.
+        cmd.arg("-iex").arg("set auto-load safe-path /");
+        cmd.arg("-iex").arg("set auto-load python-scripts on");
+
         match target {
             TargetMode::AttachPid(pid) => {
                 cmd.arg("-p").arg(pid.to_string());

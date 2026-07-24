@@ -129,6 +129,26 @@ pub struct ExecFlowData {
 }
 
 // ---------------------------------------------------------------------------
+// Variable inspector popup state
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct InspectorAction {
+    pub key: char,
+    pub label: &'static str,
+    pub desc: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct InspectorState {
+    pub expr: String,
+    pub type_name: String,
+    pub value: String,
+    pub actions: Vec<InspectorAction>,
+    pub selected: usize,
+}
+
+// ---------------------------------------------------------------------------
 // View state
 // ---------------------------------------------------------------------------
 
@@ -177,6 +197,9 @@ pub struct ViewState {
     pub help_open: bool,
     pub help_scroll: u16,
     pub quit_confirm: bool,
+
+    // Variable inspector popup
+    pub inspector: Option<InspectorState>,
 
     // Source search
     pub search_query: Option<String>,
@@ -261,6 +284,7 @@ impl Default for ViewState {
             help_open: false,
             help_scroll: 0,
             quit_confirm: false,
+            inspector: None,
 
             search_query: None,
             search_matches: Vec::new(),
@@ -551,6 +575,55 @@ async fn event_loop(
                         }
                     }
 
+                    // Inspector popup intercepts keys when open
+                    if let Some(ref mut inspector) = view.inspector {
+                        use crossterm::event::KeyCode;
+                        let action_count = inspector.actions.len();
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('X') => {
+                                view.inspector = None;
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                if action_count > 0 {
+                                    inspector.selected = (inspector.selected + 1) % action_count;
+                                }
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                if action_count > 0 {
+                                    inspector.selected = (inspector.selected + action_count - 1) % action_count;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if let Some(act) = inspector.actions.get(inspector.selected) {
+                                    let act_key = act.key;
+                                    let expr = inspector.expr.clone();
+                                    let type_name = inspector.type_name.clone();
+                                    let value = inspector.value.clone();
+                                    view.inspector = None;
+                                    execute_inspector_action(
+                                        act_key, &expr, &type_name, &value,
+                                        &mut view, &cmd_tx,
+                                    ).await;
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                if let Some(act) = inspector.actions.iter().find(|a| a.key == c) {
+                                    let act_key = act.key;
+                                    let expr = inspector.expr.clone();
+                                    let type_name = inspector.type_name.clone();
+                                    let value = inspector.value.clone();
+                                    view.inspector = None;
+                                    execute_inspector_action(
+                                        act_key, &expr, &type_name, &value,
+                                        &mut view, &cmd_tx,
+                                    ).await;
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // Help overlay intercepts all keys when open
                     if view.help_open {
                         use crossterm::event::KeyCode;
@@ -591,7 +664,7 @@ async fn event_loop(
                     }
                 }
                 Event::Mouse(mouse) => {
-                    if view.input_mode == InputMode::Normal && !view.help_open {
+                    if view.input_mode == InputMode::Normal && !view.help_open && view.inspector.is_none() {
                         if let Ok(size) = terminal.size() {
                             let area = Rect::new(0, 0, size.width, size.height);
                             let visible = view.visible_panels_ordered();
@@ -981,6 +1054,12 @@ fn build_playback_snapshot(rs: &crate::recording::RecordedState) -> GdbSnapshot 
         target_executable: None,
         recording_count: 0,
         has_debug_info: false,
+        python_available: false,
+        python_helpers_ok: false,
+        python_mode: false,
+        python_frame_level: 0,
+        native_stack: Vec::new(),
+        native_locals: Vec::new(),
     }
 }
 
@@ -1216,7 +1295,13 @@ async fn dispatch_action(
                 }
                 Panel::Stack => {
                     if let Some(frame) = snap.stack.get(view.stack_selected) {
-                        let _ = cmd_tx.send(GdbCommand::SelectFrame(frame.level)).await;
+                        if snap.python_mode {
+                            let _ = cmd_tx
+                                .send(GdbCommand::SelectPythonFrame { level: frame.level })
+                                .await;
+                        } else {
+                            let _ = cmd_tx.send(GdbCommand::SelectFrame(frame.level)).await;
+                        }
                         view.source_follow_exec = true;
                     }
                 }
@@ -1489,7 +1574,49 @@ async fn dispatch_action(
 
             match mode {
                 InputMode::Command => {
-                    let _ = cmd_tx.send(GdbCommand::RawCommand(buf)).await;
+                    if let Some(rest) = buf.strip_prefix("walk ") {
+                        let trimmed = rest.trim();
+                        let sent = if let Some(after_from) = trimmed.strip_prefix("from ") {
+                            // :walk from <start> to <end> as <type>
+                            if let Some((start_part, rest2)) = after_from.split_once(" to ") {
+                                if let Some((end_part, type_part)) = rest2.split_once(" as ") {
+                                    let _ = cmd_tx.send(GdbCommand::WalkRaw {
+                                        start_addr: start_part.trim().to_string(),
+                                        end_addr: end_part.trim().to_string(),
+                                        cast_type: type_part.trim().to_string(),
+                                    }).await;
+                                    true
+                                } else {
+                                    let _ = cmd_tx.send(GdbCommand::RawCommand(
+                                        "echo Walk syntax: walk from <start> to <end> as <type>".into()
+                                    )).await;
+                                    false
+                                }
+                            } else {
+                                let _ = cmd_tx.send(GdbCommand::RawCommand(
+                                    "echo Walk syntax: walk from <start> to <end> as <type>".into()
+                                )).await;
+                                false
+                            }
+                        } else if let Some((expr, cast_type)) = trimmed.rsplit_once(" as ") {
+                            let _ = cmd_tx.send(GdbCommand::Walk {
+                                expr: expr.trim().to_string(),
+                                cast_type: Some(cast_type.trim().to_string()),
+                            }).await;
+                            true
+                        } else {
+                            let _ = cmd_tx.send(GdbCommand::Walk {
+                                expr: trimmed.to_string(),
+                                cast_type: None,
+                            }).await;
+                            true
+                        };
+                        if sent {
+                            view.panels_visible.insert(Panel::Explorer);
+                        }
+                    } else {
+                        let _ = cmd_tx.send(GdbCommand::RawCommand(buf)).await;
+                    }
                 }
                 InputMode::Breakpoint => {
                     let _ = cmd_tx.send(GdbCommand::SetBreakpoint(buf)).await;
@@ -2032,6 +2159,10 @@ async fn dispatch_action(
         }
 
         // ---- Playback analysis ----
+        Action::TogglePythonMode => {
+            let _ = cmd_tx.send(GdbCommand::TogglePythonMode).await;
+            view.source_follow_exec = true;
+        }
         Action::ShowValueHistory => {
             if view.playback_mode {
                 if let Ok(rec) = recording.lock() {
@@ -2273,9 +2404,175 @@ async fn dispatch_action(
         Action::PromptExplorerAdd => {
             view.start_input(InputMode::ExplorerAdd);
         }
+        Action::InspectVariable => {
+            let snap = state.load();
+            if let Some(info) = build_inspector(view, &snap) {
+                view.inspector = Some(info);
+            }
+            drop(snap);
+        }
     }
 
     false
+}
+
+// ---------------------------------------------------------------------------
+// Variable inspector
+// ---------------------------------------------------------------------------
+
+fn build_inspector(view: &ViewState, snap: &GdbSnapshot) -> Option<InspectorState> {
+    let (expr, type_name, value) = match view.focused_panel {
+        Panel::Locals => {
+            let var = snap.locals.get(view.locals_selected)?;
+            (var.name.clone(), var.type_name.clone(), var.value.clone())
+        }
+        Panel::Watch => {
+            let w = snap.watch_expressions.get(view.watch_selected)?;
+            (w.expression.clone(), w.type_name.clone(), w.value.clone())
+        }
+        Panel::Explorer => {
+            let node = snap.explorer_nodes.get(view.explorer_selected)?;
+            (node.display_name.clone(), node.type_name.clone(), node.value.clone())
+        }
+        Panel::Source => {
+            let src = snap.source.as_ref()?;
+            let line_text = src.lines.get(view.source_cursor.saturating_sub(1))?;
+            let ident = extract_identifier(line_text)?;
+            (ident, String::new(), String::new())
+        }
+        _ => return None,
+    };
+
+    let is_pointer = type_name.trim_end().ends_with('*');
+    let has_hex_value = value.starts_with("0x") || value.starts_with("0X");
+    let is_container = type_name.contains("list<") || type_name.contains("vector<");
+
+    let mut actions = Vec::new();
+
+    actions.push(InspectorAction { key: 'e', label: "Explore", desc: "drill into fields" });
+
+    if is_pointer {
+        actions.push(InspectorAction { key: 'd', label: "Dereference", desc: "explore *expr" });
+    }
+
+    if has_hex_value {
+        actions.push(InspectorAction { key: 'm', label: "Memory", desc: "hex dump at value" });
+        actions.push(InspectorAction { key: 't', label: "Type overlay", desc: "cast memory as struct" });
+    } else {
+        actions.push(InspectorAction { key: 'm', label: "Memory", desc: "hex dump at &expr" });
+    }
+
+    if is_container {
+        actions.push(InspectorAction { key: 'w', label: "Walk list", desc: "iterate std::list" });
+    }
+
+    actions.push(InspectorAction { key: 'a', label: "Add watch", desc: "monitor value" });
+    actions.push(InspectorAction { key: 'p', label: "Evaluate", desc: "print expression" });
+    actions.push(InspectorAction { key: 'y', label: "Ptype", desc: "show type definition" });
+
+    Some(InspectorState {
+        expr,
+        type_name,
+        value,
+        actions,
+        selected: 0,
+    })
+}
+
+async fn execute_inspector_action(
+    key: char,
+    expr: &str,
+    type_name: &str,
+    value: &str,
+    view: &mut ViewState,
+    cmd_tx: &tokio::sync::mpsc::Sender<GdbCommand>,
+) {
+    match key {
+        'e' => {
+            let _ = cmd_tx.send(GdbCommand::ExplorerAdd(expr.to_string())).await;
+            view.panels_visible.insert(Panel::Explorer);
+            view.focused_panel = Panel::Explorer;
+        }
+        'd' => {
+            let deref = if type_name.contains('*') {
+                format!("*({expr})")
+            } else {
+                format!("*{expr}")
+            };
+            let _ = cmd_tx.send(GdbCommand::ExplorerAdd(deref)).await;
+            view.panels_visible.insert(Panel::Explorer);
+            view.focused_panel = Panel::Explorer;
+        }
+        'm' => {
+            if value.starts_with("0x") || value.starts_with("0X") {
+                if let Some(addr) = parse_hex_addr(value) {
+                    let _ = cmd_tx.send(GdbCommand::ReadMemory { addr, count: 256 }).await;
+                } else {
+                    let _ = cmd_tx.send(GdbCommand::ReadMemoryExpr {
+                        expr: value.to_string(), count: 256
+                    }).await;
+                }
+            } else {
+                let _ = cmd_tx.send(GdbCommand::ReadMemoryExpr {
+                    expr: format!("&({expr})"), count: 256
+                }).await;
+            }
+            view.panels_visible.insert(Panel::Memory);
+            view.focused_panel = Panel::Memory;
+        }
+        't' => {
+            let prefill = if value.starts_with("0x") || value.starts_with("0X") {
+                format!("{value} ")
+            } else {
+                String::new()
+            };
+            view.start_input_with(InputMode::TypeOverlay, prefill);
+        }
+        'w' => {
+            let cast = extract_inner_type(type_name);
+            let _ = cmd_tx.send(GdbCommand::Walk {
+                expr: expr.to_string(),
+                cast_type: cast,
+            }).await;
+            view.panels_visible.insert(Panel::Explorer);
+        }
+        'a' => {
+            let _ = cmd_tx.send(GdbCommand::AddWatch(expr.to_string())).await;
+        }
+        'p' => {
+            let _ = cmd_tx.send(GdbCommand::EvaluateExpression(expr.to_string())).await;
+        }
+        'y' => {
+            let _ = cmd_tx.send(GdbCommand::Ptype(expr.to_string())).await;
+        }
+        _ => {}
+    }
+}
+
+fn parse_hex_addr(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+    u64::from_str_radix(hex, 16).ok()
+}
+
+fn extract_inner_type(type_name: &str) -> Option<String> {
+    let start = type_name.find("list<")?;
+    let after = start + "list<".len();
+    let rest = &type_name[after..];
+    let mut depth = 0u32;
+    let mut end = rest.len();
+    for (i, ch) in rest.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' if depth == 0 => { end = i; break; }
+            '>' => depth -= 1,
+            ',' if depth == 0 => { end = i; break; }
+            _ => {}
+        }
+    }
+    let raw = rest[..end].trim();
+    let elem = raw.trim_end_matches(|c: char| c == '*' || c.is_whitespace());
+    if elem.is_empty() { None } else { Some(elem.to_string()) }
 }
 
 // ---------------------------------------------------------------------------
@@ -2840,6 +3137,11 @@ fn draw(f: &mut ratatui::Frame, snap: &GdbSnapshot, view: &ViewState) {
     // Input prompt overlay (if in input mode)
     if view.input_mode != InputMode::Normal {
         widgets::prompt::draw(f, f.area(), view);
+    }
+
+    // Inspector popup
+    if view.inspector.is_some() {
+        widgets::inspector::draw(f, f.area(), view);
     }
 
     // Help overlay

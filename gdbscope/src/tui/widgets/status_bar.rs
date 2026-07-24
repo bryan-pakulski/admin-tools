@@ -85,7 +85,21 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot) {
         .map(|s| format!("  {}", s))
         .unwrap_or_default();
 
-    let line = Line::from(vec![
+    // Python view indicator.
+    let py_badge = if snap.python_mode {
+        let total = snap.stack.len();
+        Some((
+            format!(" PY {}/{} ", snap.python_frame_level + 1, total.max(1)),
+            Color::Black,
+            Color::Green,
+        ))
+    } else if snap.python_available {
+        Some((" C ".to_string(), Color::Black, Color::Yellow))
+    } else {
+        None
+    };
+
+    let mut spans = vec![
         Span::styled(
             " gdbscope ",
             Style::default()
@@ -105,7 +119,17 @@ pub fn draw(f: &mut Frame, rect: Rect, snap: &GdbSnapshot) {
         Span::styled(stop_info, Style::default().fg(Color::White)),
         Span::styled(context_info, Style::default().fg(Color::White)),
         Span::styled(status_msg, Style::default().fg(Color::DarkGray)),
-    ]);
+    ];
+
+    if let Some((text, fg, bg)) = py_badge {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            text,
+            Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let line = Line::from(spans);
 
     let bar = Paragraph::new(line).style(
         Style::default()
