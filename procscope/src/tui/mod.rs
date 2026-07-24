@@ -16,7 +16,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -196,6 +196,7 @@ pub async fn run(
     cfg: Config,
     paused_tx: watch::Sender<bool>,
     interval_tx: watch::Sender<Duration>,
+    filter_tx: watch::Sender<Option<String>>,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -203,7 +204,7 @@ pub async fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = event_loop(&mut terminal, snapshot, cfg, paused_tx, interval_tx).await;
+    let result = event_loop(&mut terminal, snapshot, cfg, paused_tx, interval_tx, filter_tx).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -217,6 +218,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
     cfg: Config,
     paused_tx: watch::Sender<bool>,
     interval_tx: watch::Sender<Duration>,
+    filter_tx: watch::Sender<Option<String>>,
 ) -> Result<()> {
     let mut view = ViewState::default();
     view.window.0 = Window::closest_ge(cfg.initial_window);
@@ -273,7 +275,13 @@ async fn event_loop<B: ratatui::backend::Backend>(
                     match key.code {
                         KeyCode::Esc => view.filter_input = None,
                         KeyCode::Enter => {
-                            // For now apply via status message hint; full wiring lives in Phase 5.
+                            // Push the typed regex to the aggregator; empty clears the filter.
+                            let f = if buf.trim().is_empty() {
+                                None
+                            } else {
+                                Some(buf.clone())
+                            };
+                            let _ = filter_tx.send(f);
                             view.filter_input = None;
                         }
                         KeyCode::Backspace => {
@@ -359,7 +367,9 @@ async fn event_loop<B: ratatui::backend::Backend>(
                         view.quit_confirm = false;
                     }
                     Action::Filter => {
-                        view.filter_input = Some(String::new());
+                        // Pre-fill with the active filter so it can be edited in place.
+                        view.filter_input =
+                            Some(snapshot.load().filter.clone().unwrap_or_default());
                         view.quit_confirm = false;
                     }
                     Action::CycleView => {
@@ -456,6 +466,8 @@ fn draw(
             width: area.width.saturating_sub(4),
             height: 3,
         };
+        // Reset the cells underneath so list text doesn't bleed through the panel.
+        f.render_widget(Clear, r);
         f.render_widget(p, r);
     }
 

@@ -74,6 +74,7 @@ pub fn spawn(
     samples_rx: mpsc::Receiver<SampleBatch>,
     paused_rx: watch::Receiver<bool>,
     interval_rx: watch::Receiver<Duration>,
+    filter_rx: watch::Receiver<Option<String>>,
     csv_log: Option<CsvLog>,
 ) -> AggregatorHandles {
     let snapshot = new_shared(cfg.pid, cfg.interval, cfg.caps);
@@ -81,12 +82,12 @@ pub fn spawn(
     tokio::spawn(run(
         snap_clone,
         cfg.thresholds,
-        cfg.filter,
         cfg.recent_cap,
         cfg.max_history,
         samples_rx,
         paused_rx,
         interval_rx,
+        filter_rx,
         csv_log,
     ));
     AggregatorHandles { snapshot }
@@ -95,12 +96,12 @@ pub fn spawn(
 async fn run(
     snapshot: SharedSnapshot,
     thresholds: FreezeThresholds,
-    filter: Option<String>,
     recent_cap: usize,
     max_history: Duration,
     mut samples_rx: mpsc::Receiver<SampleBatch>,
     paused_rx: watch::Receiver<bool>,
     interval_rx: watch::Receiver<Duration>,
+    mut filter_rx: watch::Receiver<Option<String>>,
     mut csv_log: Option<CsvLog>,
 ) {
     let mut histories: HashMap<i32, ThreadHistory> = HashMap::new();
@@ -115,10 +116,11 @@ async fn run(
     let clk_tck = clk_tck();
     let ncores = num_cores();
 
-    let filter_re = filter
-        .as_deref()
-        .and_then(|s| regex::Regex::new(s).ok())
-        .map(Arc::new);
+    // Filter is live-updatable via `filter_rx` (the `f` key in the TUI). We keep the current
+    // filter string (for the on-screen indicator) alongside its compiled regex, and recompile
+    // whenever the channel changes.
+    let mut current_filter: Option<String> = filter_rx.borrow().clone();
+    let mut filter_re = compile_filter(current_filter.as_deref());
 
     let mut publish_tick = tokio::time::interval(Duration::from_millis(50));
     publish_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -141,7 +143,7 @@ async fn run(
                                 &process_history,
                                 &paused_rx,
                                 &interval_rx,
-                                filter.as_deref(),
+                                current_filter.as_deref(),
                                 &filter_re,
                                 target_gone,
                             );
@@ -170,7 +172,29 @@ async fn run(
                         &process_history,
                         &paused_rx,
                         &interval_rx,
-                        filter.as_deref(),
+                        current_filter.as_deref(),
+                        &filter_re,
+                        target_gone,
+                    );
+                }
+            }
+            // Live filter update from the TUI (`f` key). Recompile and republish immediately
+            // so the list re-filters even while paused / between sample batches.
+            res = filter_rx.changed() => {
+                if res.is_err() {
+                    // Sender dropped (TUI gone) — nothing more to update; keep running.
+                    continue;
+                }
+                current_filter = filter_rx.borrow_and_update().clone();
+                filter_re = compile_filter(current_filter.as_deref());
+                if have_data {
+                    publish_now(
+                        &snapshot,
+                        &histories,
+                        &process_history,
+                        &paused_rx,
+                        &interval_rx,
+                        current_filter.as_deref(),
                         &filter_re,
                         target_gone,
                     );
@@ -178,6 +202,14 @@ async fn run(
             }
         }
     }
+}
+
+/// Compile a filter string into a shared regex, dropping invalid patterns (no filter).
+fn compile_filter(filter: Option<&str>) -> Option<Arc<regex::Regex>> {
+    filter
+        .filter(|s| !s.is_empty())
+        .and_then(|s| regex::Regex::new(s).ok())
+        .map(Arc::new)
 }
 
 fn ingest(
@@ -428,8 +460,13 @@ fn publish_now(
         .iter()
         .filter_map(|(_tid, h)| {
             let cur = h.prev.as_ref()?;
+            let syscall_name = cur.syscall.map(|s| crate::sampler::syscall_table::name(s.nr));
+            // Filter matches against thread id, name, OR current syscall (any hit keeps it).
             if let Some(re) = filter_re {
-                if !re.is_match(&cur.name) {
+                let matches = re.is_match(&cur.name)
+                    || re.is_match(&cur.tid.to_string())
+                    || re.is_match(syscall_name.unwrap_or(""));
+                if !matches {
                     return None;
                 }
             }
@@ -440,7 +477,6 @@ fn publish_now(
             let ctxsw_iv = last.map(|r| r.ctxsw_invol_per_s).unwrap_or(0.0);
             let (mean_cpu, cpu_p50, cpu_p95, cpu_p99, cpu_max) = compute_percentiles(&h.recent);
             let iowait_pct = compute_iowait_pct(&h.recent);
-            let syscall_name = cur.syscall.map(|s| crate::sampler::syscall_table::name(s.nr));
 
             Some(ThreadView {
                 tid: cur.tid,

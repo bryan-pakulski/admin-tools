@@ -51,11 +51,16 @@ async fn run(cfg: Config) -> Result<()> {
         max_history: cfg.max_history,
     };
 
+    // Live-updatable thread filter, seeded from the CLI `--filter`. The TUI holds the sender
+    // (updated by the `f` key); the aggregator subscribes and recompiles on change.
+    let (filter_tx, filter_rx) = tokio::sync::watch::channel(cfg.filter.clone());
+
     let agg = aggregator::spawn(
         agg_cfg,
         sampler_handles.samples_rx,
         sampler_handles.paused_tx.subscribe(),
         sampler_handles.interval_tx.subscribe(),
+        filter_rx,
         csv_log,
     );
 
@@ -70,6 +75,7 @@ async fn run(cfg: Config) -> Result<()> {
             cfg.clone(),
             sampler_handles.paused_tx.clone(),
             sampler_handles.interval_tx.clone(),
+            filter_tx,
         )
         .await
     };

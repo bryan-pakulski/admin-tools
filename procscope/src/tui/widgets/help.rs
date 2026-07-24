@@ -114,7 +114,7 @@ fn content() -> Vec<Line<'static>> {
     v.push(entry("W (shift+w)", "cycle window backward"));
     v.push(entry("l", "toggle log scale on detail charts"));
     v.push(entry("a", "cycle list moving-average: off → 0.5s → 1s → 3s → 10s → 30s → 1m → off"));
-    v.push(entry("f", "filter threads by regex on name (Esc to cancel, Enter to apply)"));
+    v.push(entry("f", "filter threads by regex on tid/name/syscall (Esc to cancel, Enter to apply)"));
     v.push(entry("v", "alias for Enter (cycle view)"));
     v.push(entry("e", "export snapshot CSV to current directory"));
     v.push(entry("h  or  ?  or  F1", "open / close this help"));

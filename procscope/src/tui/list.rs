@@ -79,7 +79,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Arc<Snapshot>, view: &ViewState)
             };
 
             Row::new(vec![
-                Cell::from(format!(" {:>6}", t.tid)),
+                Cell::from(format!(" {:>7}", t.tid)),
                 Cell::from(short(&t.name, 20)),
                 Cell::from(st_span),
                 Cell::from(Span::styled(
@@ -115,7 +115,7 @@ pub fn render(f: &mut Frame, area: Rect, snap: &Arc<Snapshot>, view: &ViewState)
     let table = Table::new(
         rows,
         [
-            Constraint::Length(7),
+            Constraint::Length(8),
             Constraint::Length(20),
             Constraint::Length(4),
             Constraint::Length(6),
